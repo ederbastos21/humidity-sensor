@@ -1103,7 +1103,6 @@ def live_dashboard():
 
     # --------------------------------------------------------
     # ESTADO DA GRAVACAO
-    # (contagem removida: agora só existe no sidebar)
     # --------------------------------------------------------
 
     st.subheader("Estado da gravação")
@@ -1136,7 +1135,336 @@ def live_dashboard():
         )
 
 
-live_dashboard()
+# ============================================================
+# ANALISE DE EXPERIMENTOS SALVOS
+# ============================================================
+
+def _list_experiments():
+    """Lista pastas em EXPERIMENTS_DIR que contenham dados.csv."""
+    if not EXPERIMENTS_DIR.exists():
+        return []
+    result = [
+        d for d in EXPERIMENTS_DIR.iterdir()
+        if d.is_dir() and (d / "dados.csv").exists()
+    ]
+    result.sort(key=lambda p: p.name, reverse=True)
+    return result
+
+
+def _load_experiment(folder):
+    """Carrega dados.csv e metadados.json de uma pasta de experimento."""
+    df = pd.read_csv(folder / "dados.csv")
+    meta = None
+    meta_path = folder / "metadados.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = None
+    return df, meta
+
+
+def _format_experiment_label(folder, meta=None):
+    """Rotulo amigavel para o selectbox."""
+    if meta is None:
+        meta_path = folder / "metadados.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                meta = None
+
+    if meta:
+        nome = meta.get("nome") or folder.name
+        inicio = meta.get("inicio")
+        if inicio:
+            try:
+                dt = datetime.fromisoformat(inicio)
+                return f"{dt.strftime('%d/%m/%Y %H:%M:%S')} — {nome}"
+            except Exception:
+                pass
+        return nome
+
+    return folder.name
+
+
+def _sensors_in_df(df):
+    """Sensores conhecidos que existem como colunas no DataFrame."""
+    return [c for c in SENSOR_COLUMNS if c in df.columns]
+
+
+def _x_axis_label(x):
+    return {
+        "tempo_esp_ms": "Tempo no ESP32 (ms)",
+        "timestamp": "Data/hora",
+        "amostra": "Número da amostra",
+    }.get(x, x)
+
+
+def _plot_line(df, x, columns, title=None):
+    if not columns:
+        return None
+
+    fig = px.line(df, x=x, y=columns)
+
+    fig.for_each_trace(
+        lambda t: t.update(
+            name=SENSOR_LABELS.get(t.name, t.name)
+        )
+    )
+
+    fig.update_layout(
+        title=title,
+        yaxis_title="Valor Raw",
+        legend_title="Sensor",
+        xaxis_title=_x_axis_label(x),
+        uirevision="constante",
+        margin=dict(
+            l=10,
+            r=10,
+            t=40 if title else 10,
+            b=10,
+        ),
+    )
+
+    return fig
+
+
+def render_analysis_tab():
+    st.header("Análise de experimentos salvos")
+    st.caption(
+        f"Arquivos lidos de `{EXPERIMENTS_DIR}`. "
+        "Cada experimento é uma pasta contendo "
+        "`dados.csv` e `metadados.json`."
+    )
+
+    experiments = _list_experiments()
+
+    if not experiments:
+        st.info(
+            "Nenhum experimento encontrado. "
+            "Inicie um experimento na aba "
+            "\"Monitoramento ao vivo\" para gerar arquivos."
+        )
+        return
+
+    # ---- Navegacao: selecao de pasta ----
+    folder_names = [p.name for p in experiments]
+    labels_map = {
+        p.name: _format_experiment_label(p)
+        for p in experiments
+    }
+
+    selected_folder_name = st.selectbox(
+        "Experimento",
+        folder_names,
+        format_func=lambda n: labels_map.get(n, n),
+        key="analysis_selected_folder",
+    )
+
+    folder = EXPERIMENTS_DIR / selected_folder_name
+
+    if not folder.exists():
+        st.warning(
+            "A pasta selecionada não existe mais. "
+            "Selecione outro experimento."
+        )
+        return
+
+    try:
+        df, meta = _load_experiment(folder)
+    except Exception as exc:
+        st.error(f"Não foi possível ler o experimento: {exc}")
+        return
+
+    if df.empty:
+        st.warning("O CSV está vazio.")
+        return
+
+    st.code(str(folder), language=None)
+
+    # ---- Metadados ----
+    if meta:
+        with st.expander("📋 Metadados do experimento", expanded=False):
+            mcol1, mcol2 = st.columns(2)
+            mcol1.markdown(
+                f"**Nome:** {meta.get('nome', '—')}\n\n"
+                f"**Início:** {meta.get('inicio', '—')}\n\n"
+                f"**Fim:** {meta.get('fim', '—')}\n\n"
+                f"**Status:** {meta.get('status', '—')}"
+            )
+            mcol2.markdown(
+                f"**Duração configurada:** "
+                f"{format_duration(meta.get('duracao_configurada_segundos'))}\n\n"
+                f"**Porta:** {meta.get('porta_serial', '—')}\n\n"
+                f"**Baud:** {meta.get('baud_rate', '—')}"
+            )
+            if meta.get("descricao"):
+                st.markdown(f"**Descrição:** {meta['descricao']}")
+
+    # ---- Sensores disponiveis no CSV ----
+    available_sensors = _sensors_in_df(df)
+    if not available_sensors:
+        st.warning(
+            "O CSV não contém colunas de sensores reconhecidas."
+        )
+        return
+
+    st.caption(
+        f"{len(df):,} amostras · "
+        f"colunas: {', '.join(df.columns.tolist())}"
+    )
+
+    # ---- Preparar eixo X ----
+    df = df.copy()
+    df["amostra"] = range(1, len(df) + 1)
+
+    x_candidates = []
+    if "tempo_esp_ms" in df.columns:
+        x_candidates.append("tempo_esp_ms")
+    if "timestamp" in df.columns:
+        try:
+            df["timestamp"] = pd.to_datetime(
+                df["timestamp"], errors="coerce"
+            )
+            if df["timestamp"].notna().any():
+                x_candidates.append("timestamp")
+        except Exception:
+            pass
+    x_candidates.append("amostra")
+
+    # ---- Controles ----
+    ctrl_mode, ctrl_x, ctrl_sensors = st.columns([1.2, 1, 1.6])
+
+    mode = ctrl_mode.radio(
+        "Modo de visualização",
+        [
+            "Todos os sensores juntos",
+            "Por tipo (capacitivo/resistivo)",
+            "Um gráfico por sensor",
+        ],
+        key=f"analysis_mode_{selected_folder_name}",
+    )
+
+    x_axis = ctrl_x.selectbox(
+        "Eixo X",
+        x_candidates,
+        format_func=_x_axis_label,
+        key=f"analysis_x_axis_{selected_folder_name}",
+    )
+
+    selected_sensors = ctrl_sensors.multiselect(
+        "Sensores",
+        options=available_sensors,
+        default=available_sensors,
+        format_func=lambda s: SENSOR_LABELS.get(s, s),
+        key=f"analysis_sensors_{selected_folder_name}",
+    )
+
+    if not selected_sensors:
+        st.warning("Selecione pelo menos um sensor.")
+        return
+
+    # ---- Opcoes avancadas ----
+    with st.expander("⚙️ Opções avançadas", expanded=False):
+        max_points = st.number_input(
+            "Máximo de pontos por gráfico (0 = todos)",
+            min_value=0,
+            value=0,
+            step=500,
+            key=f"analysis_max_points_{selected_folder_name}",
+        )
+
+    df_plot = df
+    if max_points and len(df_plot) > max_points:
+        step = max(1, len(df_plot) // int(max_points))
+        df_plot = df_plot.iloc[::step].reset_index(drop=True)
+        st.caption(
+            f"Exibindo {len(df_plot):,} de {len(df):,} amostras "
+            f"(1 a cada {step} pontos)."
+        )
+
+    # ---- Estatisticas ----
+    with st.expander("📊 Estatísticas dos sensores", expanded=False):
+        stats_rows = []
+        for col in selected_sensors:
+            s = df[col]
+            stats_rows.append({
+                "Sensor": SENSOR_LABELS.get(col, col),
+                "Mínimo": float(s.min()),
+                "Máximo": float(s.max()),
+                "Média": float(s.mean()),
+                "Desvio": float(s.std()) if len(s) > 1 else 0.0,
+            })
+        st.dataframe(
+            pd.DataFrame(stats_rows),
+            width="stretch",
+            hide_index=True,
+        )
+
+    # ---- Plotagem ----
+    st.subheader("Gráficos")
+
+    if mode == "Todos os sensores juntos":
+        fig = _plot_line(df_plot, x_axis, selected_sensors)
+        st.plotly_chart(fig, width="stretch")
+
+    elif mode == "Por tipo (capacitivo/resistivo)":
+        cap_cols = [
+            c for c in selected_sensors
+            if c.startswith("capacitativo")
+        ]
+        res_cols = [
+            c for c in selected_sensors
+            if c.startswith("resistivo")
+        ]
+
+        if cap_cols:
+            st.markdown("**Sensores capacitivos**")
+            st.plotly_chart(
+                _plot_line(df_plot, x_axis, cap_cols),
+                width="stretch",
+            )
+        if res_cols:
+            st.markdown("**Sensores resistivos**")
+            st.plotly_chart(
+                _plot_line(df_plot, x_axis, res_cols),
+                width="stretch",
+            )
+
+    else:  # Um gráfico por sensor
+        cols = st.columns(2)
+        for i, sensor in enumerate(selected_sensors):
+            with cols[i % 2]:
+                fig = _plot_line(
+                    df_plot,
+                    x_axis,
+                    [sensor],
+                    title=SENSOR_LABELS.get(sensor, sensor),
+                )
+                st.plotly_chart(
+                    fig,
+                    width="stretch",
+                    key=(
+                        f"analysis_plot_{selected_folder_name}_{sensor}"
+                    ),
+                )
+
+
+# ============================================================
+# ABAS PRINCIPAIS
+# ============================================================
+
+tab_live, tab_analysis = st.tabs([
+    "📈 Monitoramento ao vivo",
+    "🗂️ Análise de experimentos",
+])
+
+with tab_live:
+    live_dashboard()
+
+with tab_analysis:
+    render_analysis_tab()
 
 
 # ============================================================
