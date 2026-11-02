@@ -1,5 +1,6 @@
 import csv
 import json
+import shutil
 import threading
 import time
 from collections import deque
@@ -194,6 +195,22 @@ class SerialCollector:
         with self.lock:
             self._close_experiment_locked("finalizado")
 
+    def discard_experiment(self):
+        """Fecha e apaga permanentemente a pasta do experimento atual."""
+        with self.lock:
+            folder = self.experiment_dir
+            if not folder or not folder.exists():
+                raise RuntimeError("Não há experimento disponível para descartar.")
+
+            # Fecha o CSV antes de remover a pasta, inclusive se estiver gravando.
+            self._close_experiment_locked("descartado")
+            shutil.rmtree(folder)
+
+            self.experiment_dir = None
+            self.metadata = None
+            self.file_handle = None
+            self.csv_writer = None
+
     def _write_metadata_locked(self):
         if self.experiment_dir and self.metadata:
             path = self.experiment_dir / "metadados.json"
@@ -298,6 +315,31 @@ with st.sidebar:
             st.success("Experimento finalizado e arquivos fechados.")
             st.rerun()
 
+    # O experimento pode ser descartado tanto durante a gravação quanto depois
+    # de finalizado/interrompido, desde que ainda exista uma pasta associada.
+    state = collector.snapshot()
+    if state["experiment_dir"]:
+        if st.button("Descartar experimento", use_container_width=True):
+            st.session_state["confirm_discard_experiment"] = True
+
+        if st.session_state.get("confirm_discard_experiment", False):
+            st.warning(
+                "Isso apagará permanentemente a pasta do experimento, "
+                "incluindo dados.csv e metadados.json."
+            )
+            confirm_col, cancel_col = st.columns(2)
+            if confirm_col.button("Confirmar descarte", type="primary", use_container_width=True):
+                try:
+                    collector.discard_experiment()
+                    st.session_state["confirm_discard_experiment"] = False
+                    st.success("Experimento descartado.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível descartar: {exc}")
+            if cancel_col.button("Cancelar", use_container_width=True):
+                st.session_state["confirm_discard_experiment"] = False
+                st.rerun()
+
     st.divider()
     st.caption("Os arquivos ficam na pasta `experimentos/` deste projeto.")
 
@@ -344,27 +386,61 @@ def live_dashboard():
     if history:
         df = pd.DataFrame(history)
         df["amostra"] = range(1, len(df) + 1)
-        selected_sensors = st.multiselect(
-            "Sensores exibidos",
-            options=CSV_COLUMNS[2:],
-            default=CSV_COLUMNS[2:],
-            format_func=lambda x: x.replace("_raw", "").replace("capacitativo", "Capacitivo ").replace("resistivo", "Resistivo ")
+
+        capacitive_columns = [
+            "capacitativo1_raw",
+            "capacitativo2_raw",
+            "capacitativo3_raw",
+        ]
+        resistive_columns = [
+            "resistivo1_raw",
+            "resistivo2_raw",
+            "resistivo3_raw",
+        ]
+        sensor_labels = {
+            "capacitativo1_raw": "Capacitivo 1",
+            "capacitativo2_raw": "Capacitivo 2",
+            "capacitativo3_raw": "Capacitivo 3",
+            "resistivo1_raw": "Resistivo 1",
+            "resistivo2_raw": "Resistivo 2",
+            "resistivo3_raw": "Resistivo 3",
+        }
+
+        st.markdown("**Sensores capacitivos**")
+        fig_cap = px.line(
+            df,
+            x="amostra",
+            y=capacitive_columns,
+            labels={
+                "amostra": "Número da amostra",
+                "value": "Valor Raw",
+                "variable": "Sensor",
+            },
         )
-        if selected_sensors:
-            long_df = df.melt(
-                id_vars=["amostra"],
-                value_vars=selected_sensors,
-                var_name="sensor",
-                value_name="Raw"
-            )
-            fig = px.line(long_df, x="amostra", y="Raw", color="sensor",
-                          title="Evolução das leituras recebidas")
-            fig.update_layout(xaxis_title="Número da amostra", yaxis_title="Valor Raw")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Selecione ao menos um sensor para exibir o gráfico.")
+        fig_cap.for_each_trace(
+            lambda trace: trace.update(name=sensor_labels.get(trace.name, trace.name))
+        )
+        fig_cap.update_layout(yaxis_title="Valor Raw", legend_title="Sensor")
+        st.plotly_chart(fig_cap, use_container_width=True)
+
+        st.markdown("**Sensores resistivos**")
+        fig_res = px.line(
+            df,
+            x="amostra",
+            y=resistive_columns,
+            labels={
+                "amostra": "Número da amostra",
+                "value": "Valor Raw",
+                "variable": "Sensor",
+            },
+        )
+        fig_res.for_each_trace(
+            lambda trace: trace.update(name=sensor_labels.get(trace.name, trace.name))
+        )
+        fig_res.update_layout(yaxis_title="Valor Raw", legend_title="Sensor")
+        st.plotly_chart(fig_res, use_container_width=True)
     else:
-        st.info("O gráfico aparecerá assim que chegarem leituras válidas.")
+        st.info("Os gráficos aparecerão assim que chegarem leituras válidas.")
 
     st.subheader("Estado da gravação")
     c1, c2 = st.columns(2)
