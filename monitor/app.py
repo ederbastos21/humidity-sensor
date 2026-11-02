@@ -34,14 +34,13 @@ SENSOR_COLUMNS = [
 
 SENSOR_LABELS = {
     "capacitativo1_raw": "Capacitivo 1",
-    "capacitativo2_raw": "Capacitivo 2",
+    "capacitativo2_raw": "Capacitativo 2",
     "capacitativo3_raw": "Capacitativo 3",
     "resistivo1_raw": "Resistivo 1",
     "resistivo2_raw": "Resistivo 2",
     "resistivo3_raw": "Resistivo 3",
 }
 
-# Correcao: o dict acima tinha "capacitativo3_raw" com typo no label.
 SENSOR_LABELS["capacitativo3_raw"] = "Capacitivo 3"
 
 CSV_COLUMNS = BASE_COLUMNS + SENSOR_COLUMNS
@@ -86,10 +85,10 @@ class SerialCollector:
         self.interval_seconds = None
         self.target_samples = None
         self.waiting_first_sample = False
-        self.t0 = None                     # datetime da 1a amostra gravada
-        self._last_recorded_at = None      # datetime da ultima amostra gravada
-        self._last_esp_ms = None           # tempo_esp_ms da amostra anterior
-        self._interval_deltas = []         # deltas de tempo_esp_ms entre amostras
+        self.t0 = None
+        self._last_recorded_at = None
+        self._last_esp_ms = None
+        self._interval_deltas = []
         self._failsafe_deadline = None
         self._failsafe_remaining = None
         self.sensors_selected = list(SENSOR_COLUMNS)
@@ -191,7 +190,6 @@ class SerialCollector:
                     self.history.append(row)
 
                     if self.recording and not self.paused and self.csv_writer:
-                        # Primeira amostra gravada: inicia t0 e agenda o fail-safe.
                         if self.waiting_first_sample:
                             self.waiting_first_sample = False
                             self.t0 = received_at
@@ -210,7 +208,6 @@ class SerialCollector:
                                 )
                                 self._write_metadata_locked()
 
-                        # Estatisticas do intervalo medido (tempo_esp_ms).
                         esp_ms = values[0]
                         if self._last_esp_ms is not None:
                             delta = esp_ms - self._last_esp_ms
@@ -223,7 +220,6 @@ class SerialCollector:
                         self.total_saved += 1
                         self._last_recorded_at = received_at
 
-                        # Condicao de parada: contagem de amostras.
                         if (
                             self.target_samples is not None
                             and self.total_saved >= self.target_samples
@@ -246,7 +242,6 @@ class SerialCollector:
                 break
 
     def _schedule_timer(self, seconds):
-        """Agenda o fail-safe (encerramento de seguranca)."""
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
@@ -262,8 +257,6 @@ class SerialCollector:
             self._timer = None
             if not self.recording or self.paused:
                 return
-            # Fail-safe: ESP provavelmente travou e nao enviou
-            # o numero alvo de amostras a tempo.
             self._close_experiment_locked("finalizado_por_failsafe")
 
     def start_experiment(self, name, description, duration_seconds,
@@ -291,8 +284,6 @@ class SerialCollector:
                     "Selecione pelo menos um sensor para gravar."
                 )
 
-            # Numero alvo de amostras (deterministico).
-            # round-half-up: 2.5 -> 3, 3.5 -> 4. Previsivel para o usuario.
             target_samples = max(
                 1, int(duration_seconds / interval_seconds + 0.5)
             )
@@ -368,8 +359,6 @@ class SerialCollector:
             self._failsafe_deadline = None
             self._failsafe_remaining = None
 
-            # Timer NAO e agendado aqui: sera agendado em _reader_loop
-            # quando a primeira amostra for gravada.
             return folder
 
     def pause(self):
@@ -398,7 +387,6 @@ class SerialCollector:
             if self.recording and self.paused:
                 self.paused = False
 
-                # Reagenda fail-safe a partir do que restava.
                 if not self.waiting_first_sample:
                     budget = self._failsafe_remaining
                     if budget is None or budget <= 0:
@@ -424,7 +412,6 @@ class SerialCollector:
                 self._close_experiment_locked("finalizado")
 
     def discard_experiment(self):
-        """Fecha e apaga permanentemente a pasta do experimento atual."""
         with self.lock:
             folder = self.experiment_dir
             if not folder or not folder.exists():
@@ -567,11 +554,6 @@ st.set_page_config(
 
 st.title("Monitoramento de umidade do solo")
 
-st.caption(
-    "ESP32 + dois ADS1115 | "
-    "Aquisição serial, gravação CSV e gráficos em tempo real"
-)
-
 
 @st.cache_resource
 def get_collector():
@@ -601,7 +583,6 @@ def sidebar_countdown_fragment():
     target = state.get("target_samples")
     saved = state.get("total_saved", 0)
     estimated = state.get("time_remaining_seconds")
-    interval = state.get("interval_seconds")
 
     if state.get("waiting_first_sample"):
         st.metric(
@@ -630,14 +611,6 @@ def sidebar_countdown_fragment():
         if target:
             st.caption(f"Amostras: **{saved} / {target}**")
 
-    if state.get("duration_seconds"):
-        st.caption(
-            f"Duração configurada: "
-            f"{format_duration(state['duration_seconds'])}"
-        )
-    if interval:
-        st.caption(f"Intervalo: {interval:g} s")
-
 
 # ============================================================
 # BARRA LATERAL
@@ -654,10 +627,6 @@ with st.sidebar:
         port_options = ["/dev/ttyUSB0", "/dev/ttyACM0"]
 
     selected_port = st.selectbox("Porta serial", port_options)
-
-    st.caption(
-        "Feche o Monitor Serial do PlatformIO antes de conectar."
-    )
 
     if not collector.snapshot()["connected"]:
         if st.button(
@@ -711,32 +680,9 @@ with st.sidebar:
 
     duration_seconds = dur_h * 3600 + dur_m * 60 + dur_s
 
-    st.caption(
-        f"Duração configurada: {format_duration(duration_seconds)}"
-    )
-
     interval = st.number_input(
         "Intervalo configurado no ESP32 (segundos)",
         min_value=1, value=2, step=1,
-    )
-
-    # Preview do numero alvo de amostras.
-    if interval > 0 and duration_seconds > 0:
-        preview_target = max(
-            1, int(duration_seconds / interval + 0.5)
-        )
-        preview_real = preview_target * interval
-        st.info(
-            f"**Amostras alvo: {preview_target}**  \n"
-            f"Duração real esperada: ~{preview_real:g} s  \n"
-            f"Critério de parada: contagem de amostras"
-        )
-
-    st.caption(
-        "ℹ️ O cronômetro começa quando a primeira amostra válida "
-        "chegar do ESP32. O experimento encerra sozinho ao atingir "
-        "o número alvo de amostras (garantindo N igual entre "
-        "repetições de mesma duração)."
     )
 
     st.markdown("**Sensores a gravar no CSV**")
@@ -885,11 +831,6 @@ with st.sidebar:
                 st.session_state["confirm_discard_experiment"] = False
                 st.rerun()
 
-    st.divider()
-    st.caption(
-        "Os arquivos ficam na pasta `experimentos/` deste projeto."
-    )
-
 
 # ============================================================
 # DASHBOARD EM TEMPO REAL
@@ -905,9 +846,7 @@ def live_dashboard():
             f"Erro na comunicação serial: {data['last_error']}"
         )
 
-    if data["connected"]:
-        st.success("Comunicação serial ativa")
-    else:
+    if not data["connected"]:
         st.warning("ESP32 desconectado")
 
     if data["recording"] and data.get("waiting_first_sample"):
@@ -928,8 +867,6 @@ def live_dashboard():
         )
     elif data["recording"]:
         st.success("Experimento em gravação")
-    else:
-        st.info("Nenhum experimento está sendo gravado.")
 
     # --------------------------------------------------------
     # PROGRESSO DA GRAVACAO
@@ -1152,11 +1089,6 @@ def _plot_line(df, x, columns, title=None):
 
 def render_analysis_tab():
     st.header("Análise de experimentos salvos")
-    st.caption(
-        f"Arquivos lidos de `{EXPERIMENTS_DIR}`. "
-        "Cada experimento é uma pasta contendo "
-        "`dados.csv` e `metadados.json`."
-    )
 
     experiments = _list_experiments()
 
@@ -1403,16 +1335,3 @@ with tab_live:
 
 with tab_analysis:
     render_analysis_tab()
-
-
-# ============================================================
-# RODAPE
-# ============================================================
-
-st.divider()
-
-st.caption(
-    "Os valores apresentados são Raw do ADS1115. "
-    "Faça a calibração individual dos sensores antes de "
-    "interpretar os valores como porcentagem de umidade."
-)
