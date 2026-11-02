@@ -1,9 +1,9 @@
+
 import atexit
 import csv
 import json
 import shutil
 import threading
-import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +13,7 @@ import plotly.express as px
 import serial
 import serial.tools.list_ports
 import streamlit as st
+
 
 BASE_DIR = Path(__file__).resolve().parent
 EXPERIMENTS_DIR = BASE_DIR / "experimentos"
@@ -56,26 +57,34 @@ class SerialCollector:
         with self.lock:
             if self.connected:
                 return
-            # exclusive=True trava a porta: se outra conexao deste app ainda
-            # estiver com ela aberta, falha com erro claro em vez de abrir um
-            # segundo leitor e embaralhar as linhas recebidas.
-            # (Nao detecta o Monitor Serial do PlatformIO: esse precisa ser fechado.)
+
+            # Impede conexoes simultaneas na mesma porta.
             try:
-                conn = serial.Serial(port, baudrate=baud, timeout=0.25, exclusive=True)
+                conn = serial.Serial(
+                    port,
+                    baudrate=baud,
+                    timeout=0.25,
+                    exclusive=True
+                )
             except serial.SerialException as exc:
                 raise RuntimeError(
                     f"Porta {port} ocupada ou indisponível ({exc}). "
                     "Feche o Monitor Serial do PlatformIO e outras conexões; "
                     "se persistir, reinicie o Streamlit."
                 ) from exc
-            # Descarta bytes antigos que eventualmente ficaram no buffer.
+
+            # Descarta bytes antigos do buffer.
             conn.reset_input_buffer()
+
             self.serial_conn = conn
             self.connected = True
             self.running = True
             self.last_error = None
+
             self.thread = threading.Thread(
-                target=self._reader_loop, args=(conn,), daemon=True
+                target=self._reader_loop,
+                args=(conn,),
+                daemon=True
             )
             self.thread.start()
 
@@ -85,19 +94,22 @@ class SerialCollector:
             self.recording = False
             self.paused = False
             self._close_experiment_locked("interrompido")
+
             self.connected = False
             thread = self.thread
             self.thread = None
-        # Espera a thread terminar (fora do lock, pois ela tambem usa o lock)
-        # antes de fechar a porta; assim nao aparece erro falso de leitura.
+
+        # Espera a thread terminar antes de fechar a porta.
         if thread and thread is not threading.current_thread():
             thread.join(timeout=2)
+
         with self.lock:
             self._close_port_locked()
 
     def _close_port_locked(self):
         conn = self.serial_conn
         self.serial_conn = None
+
         if conn:
             try:
                 conn.close()
@@ -107,22 +119,30 @@ class SerialCollector:
     def _reader_loop(self, conn):
         while True:
             with self.lock:
-                # Encerra se desconectou ou se esta thread ficou obsoleta
-                # (a conexao atual ja e outra).
+                # Encerra se desconectou ou se esta thread ficou obsoleta.
                 if not self.running or self.serial_conn is not conn:
                     break
 
             try:
                 raw_line = conn.readline()
+
                 if not raw_line:
                     continue
-                line = raw_line.decode("utf-8", errors="ignore").strip()
+
+                line = raw_line.decode(
+                    "utf-8",
+                    errors="ignore"
+                ).strip()
+
                 parts = line.split(",")
+
                 if len(parts) != 7:
                     continue
 
                 values = [int(part.strip()) for part in parts]
+
                 received_at = datetime.now().astimezone()
+
                 row = {
                     "timestamp": received_at.isoformat(timespec="seconds"),
                     "tempo_esp_ms": values[0],
@@ -138,53 +158,77 @@ class SerialCollector:
                     self.last_values = row
                     self.last_timestamp = received_at
                     self.total_received += 1
+
+                    # Historico utilizado exclusivamente pelos graficos.
                     self.history.append(row)
 
+                    # Gravacao CSV independente do historico visual.
                     if self.recording and not self.paused and self.csv_writer:
                         self.csv_writer.writerow(row)
                         self.file_handle.flush()
                         self.total_saved += 1
 
             except (ValueError, UnicodeDecodeError):
-                # Ignora linhas de inicializacao/erro que nao sejam CSV valido.
+                # Ignora linhas invalidas enviadas pelo ESP32.
                 continue
+
             except Exception as exc:
                 with self.lock:
-                    # Se a desconexao foi pedida pelo usuario, nao e erro.
                     if self.running and self.serial_conn is conn:
                         self.last_error = str(exc)
                         self.running = False
                         self.connected = False
-                        # Libera a porta (e a trava) para permitir reconectar.
+
+                        # Libera a porta para permitir reconexao.
                         self._close_port_locked()
+
                 break
 
     def start_experiment(self, name, description, interval_seconds):
         with self.lock:
             if not self.connected:
                 raise RuntimeError("Conecte o ESP32 antes de iniciar.")
+
             if self.recording:
                 raise RuntimeError("Ja existe um experimento em andamento.")
 
             now = datetime.now().astimezone()
+
             safe_name = "".join(
                 ch if ch.isalnum() or ch in "-_" else "_"
                 for ch in name.strip()
             ).strip("_")
+
             if not safe_name:
                 safe_name = "experimento"
 
-            folder_name = now.strftime("%Y%m%d_%H%M%S") + "_" + safe_name
+            folder_name = (
+                now.strftime("%Y%m%d_%H%M%S")
+                + "_"
+                + safe_name
+            )
+
             folder = EXPERIMENTS_DIR / folder_name
             folder.mkdir(parents=True, exist_ok=False)
 
             csv_path = folder / "dados.csv"
-            self.file_handle = csv_path.open("w", newline="", encoding="utf-8")
-            self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=CSV_COLUMNS)
+
+            self.file_handle = csv_path.open(
+                "w",
+                newline="",
+                encoding="utf-8"
+            )
+
+            self.csv_writer = csv.DictWriter(
+                self.file_handle,
+                fieldnames=CSV_COLUMNS
+            )
+
             self.csv_writer.writeheader()
             self.file_handle.flush()
 
             self.experiment_dir = folder
+
             self.metadata = {
                 "nome": name.strip() or "Experimento",
                 "descricao": description.strip(),
@@ -196,15 +240,25 @@ class SerialCollector:
                 "intervalo_configurado_esp_ms": None,
                 "intervalo_exibido_segundos": interval_seconds,
                 "sensores": [
-                    "capacitativo1", "capacitativo2", "capacitativo3",
-                    "resistivo1", "resistivo2", "resistivo3"
+                    "capacitativo1",
+                    "capacitativo2",
+                    "capacitativo3",
+                    "resistivo1",
+                    "resistivo2",
+                    "resistivo3"
                 ],
-                "observacao": "Valores Raw originais do ADS1115; calibracao ainda nao aplicada."
+                "observacao": (
+                    "Valores Raw originais do ADS1115; "
+                    "calibracao ainda nao aplicada."
+                )
             }
+
             self._write_metadata_locked()
+
             self.recording = True
             self.paused = False
             self.total_saved = 0
+
             return folder
 
     def pause(self):
@@ -229,11 +283,15 @@ class SerialCollector:
         """Fecha e apaga permanentemente a pasta do experimento atual."""
         with self.lock:
             folder = self.experiment_dir
-            if not folder or not folder.exists():
-                raise RuntimeError("Não há experimento disponível para descartar.")
 
-            # Fecha o CSV antes de remover a pasta, inclusive se estiver gravando.
+            if not folder or not folder.exists():
+                raise RuntimeError(
+                    "Não há experimento disponível para descartar."
+                )
+
+            # Fecha o CSV antes de remover a pasta.
             self._close_experiment_locked("descartado")
+
             shutil.rmtree(folder)
 
             self.experiment_dir = None
@@ -241,14 +299,35 @@ class SerialCollector:
             self.file_handle = None
             self.csv_writer = None
 
+    def clear_visual_history(self):
+        """
+        Limpa somente o historico utilizado pelos graficos.
+
+        Nao interfere na conexao serial, nas leituras atuais,
+        nos contadores ou nos arquivos CSV.
+        """
+        with self.lock:
+            if self.recording:
+                raise RuntimeError(
+                    "Não é possível limpar os gráficos durante um experimento."
+                )
+
+            self.history.clear()
+
     def _write_metadata_locked(self):
         if self.experiment_dir and self.metadata:
             path = self.experiment_dir / "metadados.json"
             temp_path = self.experiment_dir / "metadados.tmp"
+
             temp_path.write_text(
-                json.dumps(self.metadata, ensure_ascii=False, indent=4),
+                json.dumps(
+                    self.metadata,
+                    ensure_ascii=False,
+                    indent=4
+                ),
                 encoding="utf-8"
             )
+
             temp_path.replace(path)
 
     def _close_experiment_locked(self, final_status):
@@ -258,11 +337,17 @@ class SerialCollector:
                 self.file_handle.close()
             except Exception:
                 pass
+
         self.file_handle = None
         self.csv_writer = None
 
         if self.metadata and self.experiment_dir:
-            self.metadata["fim"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            self.metadata["fim"] = (
+                datetime.now()
+                .astimezone()
+                .isoformat(timespec="seconds")
+            )
+
             self.metadata["status"] = final_status
             self._write_metadata_locked()
 
@@ -280,116 +365,325 @@ class SerialCollector:
                 "last_error": self.last_error,
                 "total_received": self.total_received,
                 "total_saved": self.total_saved,
-                "experiment_dir": str(self.experiment_dir) if self.experiment_dir else None,
-                "metadata": dict(self.metadata) if self.metadata else None,
+                "experiment_dir": (
+                    str(self.experiment_dir)
+                    if self.experiment_dir
+                    else None
+                ),
+                "metadata": (
+                    dict(self.metadata)
+                    if self.metadata
+                    else None
+                ),
             }
 
 
-st.set_page_config(page_title="Monitoramento de umidade", page_icon="🌱", layout="wide")
+# ============================================================
+# CONFIGURACAO DA INTERFACE
+# ============================================================
+
+st.set_page_config(
+    page_title="Monitoramento de umidade",
+    page_icon="🌱",
+    layout="wide"
+)
+
 st.title("Monitoramento de umidade do solo")
-st.caption("ESP32 + dois ADS1115 | Aquisição serial, gravação CSV e gráficos em tempo real")
+
+st.caption(
+    "ESP32 + dois ADS1115 | "
+    "Aquisição serial, gravação CSV e gráficos em tempo real"
+)
+
 
 @st.cache_resource
 def get_collector():
-    """Um unico coletor para todo o processo do Streamlit.
+    """
+    Um unico coletor para todo o processo do Streamlit.
 
-    Antes ele ficava em st.session_state: cada refresh criava um coletor novo e o
-    antigo continuava lendo a serial escondido. Com cache_resource, o refresh (ou
-    outra aba) reaproveita a mesma conexao e o mesmo experimento em andamento.
+    O refresh ou outra aba reutiliza a mesma conexao
+    e o mesmo experimento em andamento.
     """
     instance = SerialCollector()
+
     # Fecha a porta e o CSV ao encerrar o Streamlit.
     atexit.register(instance.disconnect)
+
     return instance
 
 
 collector = get_collector()
 
+
+# ============================================================
+# BARRA LATERAL
+# ============================================================
+
 with st.sidebar:
+
     st.header("Conexão")
+
     ports = list(serial.tools.list_ports.comports())
     port_options = [p.device for p in ports]
-    if not port_options:
-        port_options = ["/dev/ttyUSB0", "/dev/ttyACM0"]
 
-    selected_port = st.selectbox("Porta serial", port_options)
-    st.caption("Feche o Monitor Serial do PlatformIO antes de conectar.")
+    if not port_options:
+        port_options = [
+            "/dev/ttyUSB0",
+            "/dev/ttyACM0"
+        ]
+
+    selected_port = st.selectbox(
+        "Porta serial",
+        port_options
+    )
+
+    st.caption(
+        "Feche o Monitor Serial do PlatformIO antes de conectar."
+    )
+
     if not collector.snapshot()["connected"]:
-        if st.button("Conectar ESP32", type="primary", use_container_width=True):
+
+        if st.button(
+            "Conectar ESP32",
+            type="primary",
+            use_container_width=True
+        ):
             try:
-                collector.connect(selected_port, 115200)
-                st.success(f"Conectado em {selected_port}")
+                collector.connect(
+                    selected_port,
+                    115200
+                )
+
+                st.success(
+                    f"Conectado em {selected_port}"
+                )
+
                 st.rerun()
+
             except Exception as exc:
-                st.error(f"Falha ao conectar: {exc}")
+                st.error(
+                    f"Falha ao conectar: {exc}"
+                )
+
     else:
         st.success("ESP32 conectado")
-        if st.button("Desconectar", use_container_width=True):
+
+        if st.button(
+            "Desconectar",
+            use_container_width=True
+        ):
             collector.disconnect()
             st.rerun()
 
     st.divider()
+
+    # --------------------------------------------------------
+    # NOVO EXPERIMENTO
+    # --------------------------------------------------------
+
     st.header("Novo experimento")
-    exp_name = st.text_input("Nome", value="Monitoramento do solo")
-    exp_description = st.text_area("Descrição", placeholder="Descreva as condições do experimento...")
-    interval = st.number_input("Intervalo configurado no ESP32 (segundos)", min_value=1, value=2, step=1)
-    if st.button("Iniciar experimento", type="primary", use_container_width=True):
+
+    exp_name = st.text_input(
+        "Nome",
+        value="Monitoramento do solo"
+    )
+
+    exp_description = st.text_area(
+        "Descrição",
+        placeholder="Descreva as condições do experimento..."
+    )
+
+    interval = st.number_input(
+        "Intervalo configurado no ESP32 (segundos)",
+        min_value=1,
+        value=2,
+        step=1
+    )
+
+    if st.button(
+        "Iniciar experimento",
+        type="primary",
+        use_container_width=True
+    ):
         try:
-            folder = collector.start_experiment(exp_name, exp_description, interval)
-            st.success(f"Gravando em: {folder}")
+            folder = collector.start_experiment(
+                exp_name,
+                exp_description,
+                interval
+            )
+
+            st.success(
+                f"Gravando em: {folder}"
+            )
+
             st.rerun()
+
         except Exception as exc:
             st.error(str(exc))
 
+    # --------------------------------------------------------
+    # CONTROLE DA GRAVACAO
+    # --------------------------------------------------------
+
     state = collector.snapshot()
+
     if state["recording"]:
+
         if state["paused"]:
-            if st.button("Retomar gravação", use_container_width=True):
+
+            if st.button(
+                "Retomar gravação",
+                use_container_width=True
+            ):
                 collector.resume()
                 st.rerun()
+
         else:
-            if st.button("Pausar gravação", use_container_width=True):
+
+            if st.button(
+                "Pausar gravação",
+                use_container_width=True
+            ):
                 collector.pause()
                 st.rerun()
-        if st.button("Finalizar experimento", type="secondary", use_container_width=True):
+
+        if st.button(
+            "Finalizar experimento",
+            type="secondary",
+            use_container_width=True
+        ):
             collector.finish()
-            st.success("Experimento finalizado e arquivos fechados.")
+
+            st.success(
+                "Experimento finalizado e arquivos fechados."
+            )
+
             st.rerun()
 
-    # O experimento pode ser descartado tanto durante a gravação quanto depois
-    # de finalizado/interrompido, desde que ainda exista uma pasta associada.
-    state = collector.snapshot()
-    if state["experiment_dir"]:
-        if st.button("Descartar experimento", use_container_width=True):
-            st.session_state["confirm_discard_experiment"] = True
+    # --------------------------------------------------------
+    # LIMPEZA VISUAL DOS GRAFICOS
+    # --------------------------------------------------------
 
-        if st.session_state.get("confirm_discard_experiment", False):
+    st.divider()
+    st.header("Gráficos")
+
+    state = collector.snapshot()
+
+    if state["recording"]:
+
+        st.button(
+            "Limpar gráficos",
+            disabled=True,
+            use_container_width=True,
+            help=(
+                "Finalize o experimento antes de limpar os gráficos."
+            )
+        )
+
+        st.caption(
+            "A limpeza está disponível somente quando "
+            "não há gravação ativa."
+        )
+
+    else:
+
+        if st.button(
+            "Limpar gráficos",
+            use_container_width=True
+        ):
+            try:
+                collector.clear_visual_history()
+
+                st.success(
+                    "Histórico visual dos gráficos limpo."
+                )
+
+                st.rerun()
+
+            except Exception as exc:
+                st.error(
+                    f"Não foi possível limpar os gráficos: {exc}"
+                )
+
+    # --------------------------------------------------------
+    # DESCARTAR EXPERIMENTO
+    # --------------------------------------------------------
+
+    state = collector.snapshot()
+
+    if state["experiment_dir"]:
+
+        if st.button(
+            "Descartar experimento",
+            use_container_width=True
+        ):
+            st.session_state[
+                "confirm_discard_experiment"
+            ] = True
+
+        if st.session_state.get(
+            "confirm_discard_experiment",
+            False
+        ):
+
             st.warning(
                 "Isso apagará permanentemente a pasta do experimento, "
                 "incluindo dados.csv e metadados.json."
             )
+
             confirm_col, cancel_col = st.columns(2)
-            if confirm_col.button("Confirmar descarte", type="primary", use_container_width=True):
+
+            if confirm_col.button(
+                "Confirmar descarte",
+                type="primary",
+                use_container_width=True
+            ):
                 try:
                     collector.discard_experiment()
-                    st.session_state["confirm_discard_experiment"] = False
+
+                    st.session_state[
+                        "confirm_discard_experiment"
+                    ] = False
+
                     st.success("Experimento descartado.")
+
                     st.rerun()
+
                 except Exception as exc:
-                    st.error(f"Não foi possível descartar: {exc}")
-            if cancel_col.button("Cancelar", use_container_width=True):
-                st.session_state["confirm_discard_experiment"] = False
+                    st.error(
+                        f"Não foi possível descartar: {exc}"
+                    )
+
+            if cancel_col.button(
+                "Cancelar",
+                use_container_width=True
+            ):
+                st.session_state[
+                    "confirm_discard_experiment"
+                ] = False
+
                 st.rerun()
 
     st.divider()
-    st.caption("Os arquivos ficam na pasta `experimentos/` deste projeto.")
+
+    st.caption(
+        "Os arquivos ficam na pasta `experimentos/` deste projeto."
+    )
+
+
+# ============================================================
+# DASHBOARD EM TEMPO REAL
+# ============================================================
 
 @st.fragment(run_every=1)
 def live_dashboard():
+
     data = collector.snapshot()
 
     if data["last_error"]:
-        st.error(f"Erro na comunicação serial: {data['last_error']}")
+        st.error(
+            f"Erro na comunicação serial: {data['last_error']}"
+        )
 
     if data["connected"]:
         st.success("Comunicação serial ativa")
@@ -397,15 +691,32 @@ def live_dashboard():
         st.warning("ESP32 desconectado")
 
     if data["recording"] and data["paused"]:
-        st.info("Experimento pausado: os dados continuam sendo recebidos, mas não são gravados.")
+
+        st.info(
+            "Experimento pausado: os dados continuam sendo "
+            "recebidos, mas não são gravados."
+        )
+
     elif data["recording"]:
+
         st.success("Experimento em gravação")
+
     else:
-        st.info("Nenhum experimento está sendo gravado.")
+
+        st.info(
+            "Nenhum experimento está sendo gravado."
+        )
+
+    # --------------------------------------------------------
+    # LEITURAS ATUAIS
+    # --------------------------------------------------------
 
     values = data["last_values"]
+
     if values:
+
         st.subheader("Leituras atuais (Raw)")
+
         sensor_cols = [
             ("Capacitivo 1", "capacitativo1_raw"),
             ("Capacitivo 2", "capacitativo2_raw"),
@@ -414,30 +725,55 @@ def live_dashboard():
             ("Resistivo 2", "resistivo2_raw"),
             ("Resistivo 3", "resistivo3_raw"),
         ]
-        cols = st.columns(3)
-        for idx, (label, key) in enumerate(sensor_cols):
-            cols[idx % 3].metric(label, values[key])
 
-        st.caption(f"Última leitura recebida: {values['timestamp']}")
+        cols = st.columns(3)
+
+        for idx, (label, key) in enumerate(sensor_cols):
+
+            cols[idx % 3].metric(
+                label,
+                values[key]
+            )
+
+        st.caption(
+            f"Última leitura recebida: {values['timestamp']}"
+        )
+
     else:
-        st.info("Aguardando a primeira linha válida enviada pelo ESP32...")
+
+        st.info(
+            "Aguardando a primeira linha válida enviada pelo ESP32..."
+        )
+
+    # --------------------------------------------------------
+    # GRAFICOS EM TEMPO REAL
+    # --------------------------------------------------------
 
     st.subheader("Gráficos em tempo real")
+
     history = data["history"]
+
     if history:
+
         df = pd.DataFrame(history)
-        df["amostra"] = range(1, len(df) + 1)
+
+        df["amostra"] = range(
+            1,
+            len(df) + 1
+        )
 
         capacitive_columns = [
             "capacitativo1_raw",
             "capacitativo2_raw",
             "capacitativo3_raw",
         ]
+
         resistive_columns = [
             "resistivo1_raw",
             "resistivo2_raw",
             "resistivo3_raw",
         ]
+
         sensor_labels = {
             "capacitativo1_raw": "Capacitivo 1",
             "capacitativo2_raw": "Capacitivo 2",
@@ -447,7 +783,12 @@ def live_dashboard():
             "resistivo3_raw": "Resistivo 3",
         }
 
+        # ----------------------------------------------------
+        # SENSORES CAPACITIVOS
+        # ----------------------------------------------------
+
         st.markdown("**Sensores capacitivos**")
+
         fig_cap = px.line(
             df,
             x="amostra",
@@ -458,13 +799,32 @@ def live_dashboard():
                 "variable": "Sensor",
             },
         )
+
         fig_cap.for_each_trace(
-            lambda trace: trace.update(name=sensor_labels.get(trace.name, trace.name))
+            lambda trace: trace.update(
+                name=sensor_labels.get(
+                    trace.name,
+                    trace.name
+                )
+            )
         )
-        fig_cap.update_layout(yaxis_title="Valor Raw", legend_title="Sensor")
-        st.plotly_chart(fig_cap, use_container_width=True)
+
+        fig_cap.update_layout(
+            yaxis_title="Valor Raw",
+            legend_title="Sensor"
+        )
+
+        st.plotly_chart(
+            fig_cap,
+            use_container_width=True
+        )
+
+        # ----------------------------------------------------
+        # SENSORES RESISTIVOS
+        # ----------------------------------------------------
 
         st.markdown("**Sensores resistivos**")
+
         fig_res = px.line(
             df,
             x="amostra",
@@ -475,22 +835,69 @@ def live_dashboard():
                 "variable": "Sensor",
             },
         )
+
         fig_res.for_each_trace(
-            lambda trace: trace.update(name=sensor_labels.get(trace.name, trace.name))
+            lambda trace: trace.update(
+                name=sensor_labels.get(
+                    trace.name,
+                    trace.name
+                )
+            )
         )
-        fig_res.update_layout(yaxis_title="Valor Raw", legend_title="Sensor")
-        st.plotly_chart(fig_res, use_container_width=True)
+
+        fig_res.update_layout(
+            yaxis_title="Valor Raw",
+            legend_title="Sensor"
+        )
+
+        st.plotly_chart(
+            fig_res,
+            use_container_width=True
+        )
+
     else:
-        st.info("Os gráficos aparecerão assim que chegarem leituras válidas.")
+
+        st.info(
+            "Os gráficos aparecerão assim que chegarem leituras válidas."
+        )
+
+    # --------------------------------------------------------
+    # ESTADO DA GRAVACAO
+    # --------------------------------------------------------
 
     st.subheader("Estado da gravação")
+
     c1, c2 = st.columns(2)
-    c1.metric("Linhas recebidas", data["total_received"])
-    c2.metric("Linhas gravadas", data["total_saved"])
+
+    c1.metric(
+        "Linhas recebidas",
+        data["total_received"]
+    )
+
+    c2.metric(
+        "Linhas gravadas",
+        data["total_saved"]
+    )
+
     if data["experiment_dir"]:
-        st.code(data["experiment_dir"], language=None)
+
+        st.code(
+            data["experiment_dir"],
+            language=None
+        )
+
 
 live_dashboard()
 
+
+# ============================================================
+# RODAPE
+# ============================================================
+
 st.divider()
-st.caption("Os valores apresentados são Raw do ADS1115. Faça a calibração individual dos sensores antes de interpretar os valores como porcentagem de umidade.")
+
+st.caption(
+    "Os valores apresentados são Raw do ADS1115. "
+    "Faça a calibração individual dos sensores antes de "
+    "interpretar os valores como porcentagem de umidade."
+)
