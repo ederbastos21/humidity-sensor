@@ -1,3 +1,4 @@
+import atexit
 import csv
 import json
 import shutil
@@ -55,13 +56,27 @@ class SerialCollector:
         with self.lock:
             if self.connected:
                 return
-            self.serial_conn = serial.Serial(port, baudrate=baud, timeout=0.25)
+            # exclusive=True trava a porta: se outra conexao deste app ainda
+            # estiver com ela aberta, falha com erro claro em vez de abrir um
+            # segundo leitor e embaralhar as linhas recebidas.
+            # (Nao detecta o Monitor Serial do PlatformIO: esse precisa ser fechado.)
+            try:
+                conn = serial.Serial(port, baudrate=baud, timeout=0.25, exclusive=True)
+            except serial.SerialException as exc:
+                raise RuntimeError(
+                    f"Porta {port} ocupada ou indisponível ({exc}). "
+                    "Feche o Monitor Serial do PlatformIO e outras conexões; "
+                    "se persistir, reinicie o Streamlit."
+                ) from exc
             # Descarta bytes antigos que eventualmente ficaram no buffer.
-            self.serial_conn.reset_input_buffer()
+            conn.reset_input_buffer()
+            self.serial_conn = conn
             self.connected = True
             self.running = True
             self.last_error = None
-            self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self.thread = threading.Thread(
+                target=self._reader_loop, args=(conn,), daemon=True
+            )
             self.thread.start()
 
     def disconnect(self):
@@ -70,21 +85,32 @@ class SerialCollector:
             self.recording = False
             self.paused = False
             self._close_experiment_locked("interrompido")
-            conn = self.serial_conn
-            self.serial_conn = None
             self.connected = False
+            thread = self.thread
+            self.thread = None
+        # Espera a thread terminar (fora do lock, pois ela tambem usa o lock)
+        # antes de fechar a porta; assim nao aparece erro falso de leitura.
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        with self.lock:
+            self._close_port_locked()
+
+    def _close_port_locked(self):
+        conn = self.serial_conn
+        self.serial_conn = None
         if conn:
             try:
                 conn.close()
             except Exception:
                 pass
 
-    def _reader_loop(self):
+    def _reader_loop(self, conn):
         while True:
             with self.lock:
-                if not self.running:
+                # Encerra se desconectou ou se esta thread ficou obsoleta
+                # (a conexao atual ja e outra).
+                if not self.running or self.serial_conn is not conn:
                     break
-                conn = self.serial_conn
 
             try:
                 raw_line = conn.readline()
@@ -124,9 +150,13 @@ class SerialCollector:
                 continue
             except Exception as exc:
                 with self.lock:
-                    self.last_error = str(exc)
-                    self.running = False
-                    self.connected = False
+                    # Se a desconexao foi pedida pelo usuario, nao e erro.
+                    if self.running and self.serial_conn is conn:
+                        self.last_error = str(exc)
+                        self.running = False
+                        self.connected = False
+                        # Libera a porta (e a trava) para permitir reconectar.
+                        self._close_port_locked()
                 break
 
     def start_experiment(self, name, description, interval_seconds):
@@ -259,10 +289,21 @@ st.set_page_config(page_title="Monitoramento de umidade", page_icon="🌱", layo
 st.title("Monitoramento de umidade do solo")
 st.caption("ESP32 + dois ADS1115 | Aquisição serial, gravação CSV e gráficos em tempo real")
 
-if "collector" not in st.session_state:
-    st.session_state.collector = SerialCollector()
+@st.cache_resource
+def get_collector():
+    """Um unico coletor para todo o processo do Streamlit.
 
-collector = st.session_state.collector
+    Antes ele ficava em st.session_state: cada refresh criava um coletor novo e o
+    antigo continuava lendo a serial escondido. Com cache_resource, o refresh (ou
+    outra aba) reaproveita a mesma conexao e o mesmo experimento em andamento.
+    """
+    instance = SerialCollector()
+    # Fecha a porta e o CSV ao encerrar o Streamlit.
+    atexit.register(instance.disconnect)
+    return instance
+
+
+collector = get_collector()
 
 with st.sidebar:
     st.header("Conexão")
