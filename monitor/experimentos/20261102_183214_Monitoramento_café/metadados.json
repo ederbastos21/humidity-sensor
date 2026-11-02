@@ -1,0 +1,24 @@
+{
+    "nome": "Monitoramento café",
+    "descricao": "teste",
+    "inicio": "2026-11-02T18:32:14-03:00",
+    "fim": "2026-11-02T18:37:40-03:00",
+    "status": "interrompido",
+    "porta_serial": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "intervalo_configurado_esp_ms": null,
+    "intervalo_exibido_segundos": null,
+    "duracao_configurada_segundos": 300,
+    "sensores_selecionados": [
+        "resistivo1_raw"
+    ],
+    "sensores_disponiveis": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw",
+        "resistivo1_raw",
+        "resistivo2_raw",
+        "resistivo3_raw"
+    ],
+    "observacao": "Valores Raw originais do ADS1115; calibracao ainda nao aplicada."
+}

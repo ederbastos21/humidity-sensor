@@ -625,7 +625,7 @@ with st.sidebar:
         if st.button(
             "Conectar ESP32",
             type="primary",
-            use_container_width=True
+            width="stretch",
         ):
             try:
                 collector.connect(
@@ -649,7 +649,7 @@ with st.sidebar:
 
         if st.button(
             "Desconectar",
-            use_container_width=True
+            width="stretch",
         ):
             collector.disconnect()
             st.rerun()
@@ -741,7 +741,7 @@ with st.sidebar:
         if st.button(
             "Iniciar experimento",
             type="primary",
-            use_container_width=True
+            width="stretch",
         ):
             try:
                 if duration_seconds <= 0:
@@ -781,7 +781,7 @@ with st.sidebar:
 
             if st.button(
                 "Retomar gravação",
-                use_container_width=True
+                width="stretch",
             ):
                 collector.resume()
                 st.rerun()
@@ -790,7 +790,7 @@ with st.sidebar:
 
             if st.button(
                 "Pausar gravação",
-                use_container_width=True
+                width="stretch",
             ):
                 collector.pause()
                 st.rerun()
@@ -798,7 +798,7 @@ with st.sidebar:
         if st.button(
             "Finalizar experimento",
             type="secondary",
-            use_container_width=True
+            width="stretch",
         ):
             collector.finish()
 
@@ -822,7 +822,7 @@ with st.sidebar:
         st.button(
             "Limpar gráficos",
             disabled=True,
-            use_container_width=True,
+            width="stretch",
             help=(
                 "Finalize o experimento antes de limpar os gráficos."
             )
@@ -837,7 +837,7 @@ with st.sidebar:
 
         if st.button(
             "Limpar gráficos",
-            use_container_width=True
+            width="stretch",
         ):
             try:
                 collector.clear_visual_history()
@@ -863,7 +863,7 @@ with st.sidebar:
 
         if st.button(
             "Descartar experimento",
-            use_container_width=True
+            width="stretch",
         ):
             st.session_state[
                 "confirm_discard_experiment"
@@ -884,7 +884,7 @@ with st.sidebar:
             if confirm_col.button(
                 "Confirmar descarte",
                 type="primary",
-                use_container_width=True
+                width="stretch",
             ):
                 try:
                     collector.discard_experiment()
@@ -904,7 +904,7 @@ with st.sidebar:
 
             if cancel_col.button(
                 "Cancelar",
-                use_container_width=True
+                width="stretch",
             ):
                 st.session_state[
                     "confirm_discard_experiment"
@@ -1056,7 +1056,7 @@ def live_dashboard():
 
         st.plotly_chart(
             fig_cap,
-            use_container_width=True
+            width="stretch",
         )
 
         # ----------------------------------------------------
@@ -1092,7 +1092,7 @@ def live_dashboard():
 
         st.plotly_chart(
             fig_res,
-            use_container_width=True
+            width="stretch",
         )
 
     else:
