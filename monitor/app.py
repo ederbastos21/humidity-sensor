@@ -35,11 +35,14 @@ SENSOR_COLUMNS = [
 SENSOR_LABELS = {
     "capacitativo1_raw": "Capacitivo 1",
     "capacitativo2_raw": "Capacitivo 2",
-    "capacitativo3_raw": "Capacitivo 3",
+    "capacitativo3_raw": "Capacitativo 3",
     "resistivo1_raw": "Resistivo 1",
     "resistivo2_raw": "Resistivo 2",
     "resistivo3_raw": "Resistivo 3",
 }
+
+# Correcao: o dict acima tinha "capacitativo3_raw" com typo no label.
+SENSOR_LABELS["capacitativo3_raw"] = "Capacitivo 3"
 
 CSV_COLUMNS = BASE_COLUMNS + SENSOR_COLUMNS
 
@@ -78,10 +81,17 @@ class SerialCollector:
         self.total_saved = 0
         self.history = deque(maxlen=600)
 
-        # Controle de duracao
-        self.end_time = None
-        self.paused_remaining = None
+        # Controle do experimento
         self.duration_seconds = None
+        self.interval_seconds = None
+        self.target_samples = None
+        self.waiting_first_sample = False
+        self.t0 = None                     # datetime da 1a amostra gravada
+        self._last_recorded_at = None      # datetime da ultima amostra gravada
+        self._last_esp_ms = None           # tempo_esp_ms da amostra anterior
+        self._interval_deltas = []         # deltas de tempo_esp_ms entre amostras
+        self._failsafe_deadline = None
+        self._failsafe_remaining = None
         self.sensors_selected = list(SENSOR_COLUMNS)
         self._timer = None
 
@@ -90,13 +100,12 @@ class SerialCollector:
             if self.connected:
                 return
 
-            # Impede conexoes simultaneas na mesma porta.
             try:
                 conn = serial.Serial(
                     port,
                     baudrate=baud,
                     timeout=0.25,
-                    exclusive=True
+                    exclusive=True,
                 )
             except serial.SerialException as exc:
                 raise RuntimeError(
@@ -105,7 +114,6 @@ class SerialCollector:
                     "se persistir, reinicie o Streamlit."
                 ) from exc
 
-            # Descarta bytes antigos do buffer.
             conn.reset_input_buffer()
 
             self.serial_conn = conn
@@ -116,7 +124,7 @@ class SerialCollector:
             self.thread = threading.Thread(
                 target=self._reader_loop,
                 args=(conn,),
-                daemon=True
+                daemon=True,
             )
             self.thread.start()
 
@@ -131,7 +139,6 @@ class SerialCollector:
             thread = self.thread
             self.thread = None
 
-        # Espera a thread terminar antes de fechar a porta.
         if thread and thread is not threading.current_thread():
             thread.join(timeout=2)
 
@@ -141,7 +148,6 @@ class SerialCollector:
     def _close_port_locked(self):
         conn = self.serial_conn
         self.serial_conn = None
-
         if conn:
             try:
                 conn.close()
@@ -151,28 +157,20 @@ class SerialCollector:
     def _reader_loop(self, conn):
         while True:
             with self.lock:
-                # Encerra se desconectou ou se esta thread ficou obsoleta.
                 if not self.running or self.serial_conn is not conn:
                     break
 
             try:
                 raw_line = conn.readline()
-
                 if not raw_line:
                     continue
 
-                line = raw_line.decode(
-                    "utf-8",
-                    errors="ignore"
-                ).strip()
-
+                line = raw_line.decode("utf-8", errors="ignore").strip()
                 parts = line.split(",")
-
                 if len(parts) != 7:
                     continue
 
                 values = [int(part.strip()) for part in parts]
-
                 received_at = datetime.now().astimezone()
 
                 row = {
@@ -190,20 +188,52 @@ class SerialCollector:
                     self.last_values = row
                     self.last_timestamp = received_at
                     self.total_received += 1
-
-                    # Historico utilizado exclusivamente pelos graficos.
                     self.history.append(row)
 
-                    # Gravacao CSV independente do historico visual.
-                    # extrasaction="ignore" faz o DictWriter descartar
-                    # automaticamente as colunas nao selecionadas.
                     if self.recording and not self.paused and self.csv_writer:
+                        # Primeira amostra gravada: inicia t0 e agenda o fail-safe.
+                        if self.waiting_first_sample:
+                            self.waiting_first_sample = False
+                            self.t0 = received_at
+                            self._last_esp_ms = None
+
+                            failsafe_seconds = self.duration_seconds * 2 + 30
+                            self._failsafe_deadline = (
+                                received_at + timedelta(seconds=failsafe_seconds)
+                            )
+                            self._schedule_timer(failsafe_seconds)
+
+                            if self.metadata is not None:
+                                self.metadata["status"] = "em_andamento"
+                                self.metadata["t0_primeira_amostra"] = (
+                                    received_at.isoformat(timespec="seconds")
+                                )
+                                self._write_metadata_locked()
+
+                        # Estatisticas do intervalo medido (tempo_esp_ms).
+                        esp_ms = values[0]
+                        if self._last_esp_ms is not None:
+                            delta = esp_ms - self._last_esp_ms
+                            if delta > 0:
+                                self._interval_deltas.append(delta)
+                        self._last_esp_ms = esp_ms
+
                         self.csv_writer.writerow(row)
                         self.file_handle.flush()
                         self.total_saved += 1
+                        self._last_recorded_at = received_at
+
+                        # Condicao de parada: contagem de amostras.
+                        if (
+                            self.target_samples is not None
+                            and self.total_saved >= self.target_samples
+                        ):
+                            self._close_experiment_locked(
+                                "finalizado_por_amostras"
+                            )
+                            break
 
             except (ValueError, UnicodeDecodeError):
-                # Ignora linhas invalidas enviadas pelo ESP32.
                 continue
 
             except Exception as exc:
@@ -212,14 +242,11 @@ class SerialCollector:
                         self.last_error = str(exc)
                         self.running = False
                         self.connected = False
-
-                        # Libera a porta para permitir reconexao.
                         self._close_port_locked()
-
                 break
 
     def _schedule_timer(self, seconds):
-        """Agenda a finalizacao automatica do experimento."""
+        """Agenda o fail-safe (encerramento de seguranca)."""
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
@@ -233,25 +260,28 @@ class SerialCollector:
     def _on_timer_expire(self):
         with self.lock:
             self._timer = None
-            # Se o usuario pausou exatamente agora, nao finaliza.
             if not self.recording or self.paused:
                 return
-            self._close_experiment_locked("finalizado_por_tempo")
+            # Fail-safe: ESP provavelmente travou e nao enviou
+            # o numero alvo de amostras a tempo.
+            self._close_experiment_locked("finalizado_por_failsafe")
 
-    def start_experiment(self, name, description, duration_seconds, sensors_selected):
+    def start_experiment(self, name, description, duration_seconds,
+                         sensors_selected, interval_seconds):
         with self.lock:
             if not self.connected:
                 raise RuntimeError("Conecte o ESP32 antes de iniciar.")
-
             if self.recording:
                 raise RuntimeError("Ja existe um experimento em andamento.")
-
             if duration_seconds is None or duration_seconds <= 0:
                 raise RuntimeError(
                     "A duração do experimento deve ser maior que zero."
                 )
+            if interval_seconds is None or interval_seconds <= 0:
+                raise RuntimeError(
+                    "O intervalo do ESP32 deve ser maior que zero."
+                )
 
-            # Filtra a selecao pelos nomes canonicos conhecidos.
             selected = [
                 s for s in SENSOR_COLUMNS
                 if s in (sensors_selected or [])
@@ -261,45 +291,35 @@ class SerialCollector:
                     "Selecione pelo menos um sensor para gravar."
                 )
 
+            # Numero alvo de amostras (deterministico).
+            # round-half-up: 2.5 -> 3, 3.5 -> 4. Previsivel para o usuario.
+            target_samples = max(
+                1, int(duration_seconds / interval_seconds + 0.5)
+            )
+
             now = datetime.now().astimezone()
 
             safe_name = "".join(
                 ch if ch.isalnum() or ch in "-_" else "_"
                 for ch in name.strip()
             ).strip("_")
-
             if not safe_name:
                 safe_name = "experimento"
 
-            folder_name = (
-                now.strftime("%Y%m%d_%H%M%S")
-                + "_"
-                + safe_name
-            )
-
+            folder_name = now.strftime("%Y%m%d_%H%M%S") + "_" + safe_name
             folder = EXPERIMENTS_DIR / folder_name
             folder.mkdir(parents=True, exist_ok=False)
-
             csv_path = folder / "dados.csv"
 
-            self.file_handle = csv_path.open(
-                "w",
-                newline="",
-                encoding="utf-8"
-            )
-
-            # Header dinamico: base + apenas os sensores selecionados.
+            self.file_handle = csv_path.open("w", newline="", encoding="utf-8")
             self.csv_fieldnames = BASE_COLUMNS + selected
-
             self.csv_writer = csv.DictWriter(
                 self.file_handle,
                 fieldnames=self.csv_fieldnames,
                 extrasaction="ignore",
             )
-
             self.csv_writer.writeheader()
             self.file_handle.flush()
-
             self.experiment_dir = folder
 
             self.metadata = {
@@ -307,20 +327,30 @@ class SerialCollector:
                 "descricao": description.strip(),
                 "inicio": now.isoformat(timespec="seconds"),
                 "fim": None,
-                "status": "em_andamento",
+                "t0_primeira_amostra": None,
+                "tN_ultima_amostra": None,
+                "duracao_configurada_segundos": int(duration_seconds),
+                "duracao_real_segundos": None,
+                "intervalo_configurado_segundos": float(interval_seconds),
+                "amostras_alvo": int(target_samples),
+                "amostras_gravadas": 0,
+                "intervalo_medido_ms_media": None,
+                "intervalo_medido_ms_dp": None,
+                "intervalo_medido_ms_min": None,
+                "intervalo_medido_ms_max": None,
+                "intervalo_medido_deltas_n": 0,
+                "status": "aguardando_primeira_amostra",
                 "porta_serial": self.serial_conn.port,
                 "baud_rate": 115200,
-                "intervalo_configurado_esp_ms": None,
-                "intervalo_exibido_segundos": None,
-                "duracao_configurada_segundos": int(duration_seconds),
                 "sensores_selecionados": list(selected),
                 "sensores_disponiveis": list(SENSOR_COLUMNS),
                 "observacao": (
                     "Valores Raw originais do ADS1115; "
-                    "calibracao ainda nao aplicada."
-                )
+                    "calibracao ainda nao aplicada. "
+                    "Criterio de parada: contagem de amostras "
+                    "(duracao / intervalo)."
+                ),
             }
-
             self._write_metadata_locked()
 
             self.recording = True
@@ -328,11 +358,18 @@ class SerialCollector:
             self.total_saved = 0
             self.sensors_selected = selected
             self.duration_seconds = duration_seconds
-            self.end_time = now + timedelta(seconds=duration_seconds)
-            self.paused_remaining = None
+            self.interval_seconds = interval_seconds
+            self.target_samples = target_samples
+            self.waiting_first_sample = True
+            self.t0 = None
+            self._last_recorded_at = None
+            self._last_esp_ms = None
+            self._interval_deltas = []
+            self._failsafe_deadline = None
+            self._failsafe_remaining = None
 
-            self._schedule_timer(duration_seconds)
-
+            # Timer NAO e agendado aqui: sera agendado em _reader_loop
+            # quando a primeira amostra for gravada.
             return folder
 
     def pause(self):
@@ -340,17 +377,17 @@ class SerialCollector:
             if self.recording and not self.paused:
                 self.paused = True
 
-                # Congela o cronometro: guarda o quanto falta e cancela o timer.
                 if self._timer is not None:
                     self._timer.cancel()
                     self._timer = None
 
-                if self.end_time is not None:
-                    self.paused_remaining = max(
+                if self._failsafe_deadline is not None:
+                    self._failsafe_remaining = max(
                         0.0,
                         (
-                            self.end_time - datetime.now().astimezone()
-                        ).total_seconds()
+                            self._failsafe_deadline
+                            - datetime.now().astimezone()
+                        ).total_seconds(),
                     )
 
                 self.metadata["status"] = "pausado"
@@ -361,80 +398,65 @@ class SerialCollector:
             if self.recording and self.paused:
                 self.paused = False
 
-                if self.paused_remaining is not None:
-                    if self.paused_remaining > 0:
-                        self.end_time = (
-                            datetime.now().astimezone()
-                            + timedelta(seconds=self.paused_remaining)
-                        )
-                        self._schedule_timer(self.paused_remaining)
-                    else:
-                        # Nao havia tempo restante: finaliza imediatamente.
-                        self.paused_remaining = None
-                        self._close_experiment_locked("finalizado_por_tempo")
-                        return
+                # Reagenda fail-safe a partir do que restava.
+                if not self.waiting_first_sample:
+                    budget = self._failsafe_remaining
+                    if budget is None or budget <= 0:
+                        budget = self.duration_seconds * 2 + 30
+                    self._failsafe_deadline = (
+                        datetime.now().astimezone()
+                        + timedelta(seconds=budget)
+                    )
+                    self._schedule_timer(budget)
 
-                self.paused_remaining = None
-                self.metadata["status"] = "em_andamento"
+                self._failsafe_remaining = None
+
+                if self.waiting_first_sample:
+                    self.metadata["status"] = "aguardando_primeira_amostra"
+                else:
+                    self.metadata["status"] = "em_andamento"
+
                 self._write_metadata_locked()
 
     def finish(self):
         with self.lock:
-            self._close_experiment_locked("finalizado")
+            if self.recording:
+                self._close_experiment_locked("finalizado")
 
     def discard_experiment(self):
         """Fecha e apaga permanentemente a pasta do experimento atual."""
         with self.lock:
             folder = self.experiment_dir
-
             if not folder or not folder.exists():
                 raise RuntimeError(
                     "Não há experimento disponível para descartar."
                 )
-
-            # Fecha o CSV antes de remover a pasta.
             self._close_experiment_locked("descartado")
-
             shutil.rmtree(folder)
-
             self.experiment_dir = None
             self.metadata = None
             self.file_handle = None
             self.csv_writer = None
 
     def clear_visual_history(self):
-        """
-        Limpa somente o historico utilizado pelos graficos.
-
-        Nao interfere na conexao serial, nas leituras atuais,
-        nos contadores ou nos arquivos CSV.
-        """
         with self.lock:
             if self.recording:
                 raise RuntimeError(
                     "Não é possível limpar os gráficos durante um experimento."
                 )
-
             self.history.clear()
 
     def _write_metadata_locked(self):
         if self.experiment_dir and self.metadata:
             path = self.experiment_dir / "metadados.json"
             temp_path = self.experiment_dir / "metadados.tmp"
-
             temp_path.write_text(
-                json.dumps(
-                    self.metadata,
-                    ensure_ascii=False,
-                    indent=4
-                ),
-                encoding="utf-8"
+                json.dumps(self.metadata, ensure_ascii=False, indent=4),
+                encoding="utf-8",
             )
-
             temp_path.replace(path)
 
     def _close_experiment_locked(self, final_status):
-        # Cancela o timer caso ainda exista.
         if self._timer is not None:
             try:
                 self._timer.cancel()
@@ -453,55 +475,82 @@ class SerialCollector:
         self.csv_writer = None
 
         if self.metadata and self.experiment_dir:
-            self.metadata["fim"] = (
-                datetime.now()
-                .astimezone()
-                .isoformat(timespec="seconds")
-            )
-
+            end_now = datetime.now().astimezone()
+            self.metadata["fim"] = end_now.isoformat(timespec="seconds")
             self.metadata["status"] = final_status
+            self.metadata["amostras_gravadas"] = int(self.total_saved)
+
+            if self._last_recorded_at is not None:
+                self.metadata["tN_ultima_amostra"] = (
+                    self._last_recorded_at.isoformat(timespec="seconds")
+                )
+
+            if self.t0 is not None and self._last_recorded_at is not None:
+                real_duration = (
+                    self._last_recorded_at - self.t0
+                ).total_seconds()
+                self.metadata["duracao_real_segundos"] = round(real_duration, 3)
+
+            deltas = self._interval_deltas
+            if deltas:
+                n = len(deltas)
+                mean = sum(deltas) / n
+                if n > 1:
+                    var = sum((d - mean) ** 2 for d in deltas) / (n - 1)
+                    std = var ** 0.5
+                else:
+                    std = 0.0
+                self.metadata["intervalo_medido_ms_media"] = round(mean, 2)
+                self.metadata["intervalo_medido_ms_dp"] = round(std, 2)
+                self.metadata["intervalo_medido_ms_min"] = int(min(deltas))
+                self.metadata["intervalo_medido_ms_max"] = int(max(deltas))
+                self.metadata["intervalo_medido_deltas_n"] = n
+
             self._write_metadata_locked()
 
         self.recording = False
         self.paused = False
-        self.end_time = None
-        self.paused_remaining = None
+        self.waiting_first_sample = False
+        self._failsafe_deadline = None
+        self._failsafe_remaining = None
 
     def snapshot(self):
         with self.lock:
-            time_remaining = None
+            samples_remaining = None
+            time_remaining_estimate = None
+
             if self.recording:
-                if self.paused and self.paused_remaining is not None:
-                    time_remaining = self.paused_remaining
-                elif not self.paused and self.end_time is not None:
-                    time_remaining = max(
-                        0.0,
-                        (
-                            self.end_time - datetime.now().astimezone()
-                        ).total_seconds()
+                if self.target_samples is not None:
+                    samples_remaining = max(
+                        0, self.target_samples - self.total_saved
                     )
+                    if self.interval_seconds:
+                        time_remaining_estimate = (
+                            samples_remaining * self.interval_seconds
+                        )
 
             return {
                 "connected": self.connected,
                 "recording": self.recording,
                 "paused": self.paused,
+                "waiting_first_sample": self.waiting_first_sample,
                 "last_values": self.last_values,
                 "history": list(self.history),
                 "last_error": self.last_error,
                 "total_received": self.total_received,
                 "total_saved": self.total_saved,
+                "target_samples": self.target_samples,
+                "samples_remaining": samples_remaining,
                 "experiment_dir": (
                     str(self.experiment_dir)
-                    if self.experiment_dir
-                    else None
+                    if self.experiment_dir else None
                 ),
                 "metadata": (
-                    dict(self.metadata)
-                    if self.metadata
-                    else None
+                    dict(self.metadata) if self.metadata else None
                 ),
-                "time_remaining_seconds": time_remaining,
+                "time_remaining_seconds": time_remaining_estimate,
                 "duration_seconds": self.duration_seconds,
+                "interval_seconds": self.interval_seconds,
                 "sensors_selected": list(self.sensors_selected),
             }
 
@@ -513,7 +562,7 @@ class SerialCollector:
 st.set_page_config(
     page_title="Monitoramento de umidade",
     page_icon="🌱",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("Monitoramento de umidade do solo")
@@ -526,17 +575,8 @@ st.caption(
 
 @st.cache_resource
 def get_collector():
-    """
-    Um unico coletor para todo o processo do Streamlit.
-
-    O refresh ou outra aba reutiliza a mesma conexao
-    e o mesmo experimento em andamento.
-    """
     instance = SerialCollector()
-
-    # Fecha a porta e o CSV ao encerrar o Streamlit.
     atexit.register(instance.disconnect)
-
     return instance
 
 
@@ -544,15 +584,6 @@ collector = get_collector()
 
 
 def _rerun_app():
-    """
-    Forca um rerun completo do app (nao apenas do fragmento atual).
-
-    Necessario para que o botao "Iniciar experimento" volte a aparecer
-    no sidebar quando o experimento terminar por tempo enquanto o usuario
-    esta ocioso. Usa fallback para versoes antigas do Streamlit onde o
-    parametro `scope` ainda nao existe (nessas versoes, st.rerun() ja
-    rerenderizava o app inteiro).
-    """
     try:
         st.rerun(scope="app")
     except TypeError:
@@ -561,37 +592,51 @@ def _rerun_app():
 
 @st.fragment(run_every=1)
 def sidebar_countdown_fragment():
-    """
-    Contagem regressiva do experimento em andamento, exibida no lugar
-    do botao "Iniciar experimento" dentro do menu "Novo experimento".
-    """
     state = collector.snapshot()
 
     if not state["recording"]:
-        # O experimento terminou enquanto este fragmento estava ativo
-        # (provavelmente por tempo, via timer em background). Forca um
-        # rerun completo para que o botao "Iniciar experimento" volte
-        # a aparecer no sidebar.
         _rerun_app()
         return
 
-    remaining = state["time_remaining_seconds"]
+    target = state.get("target_samples")
+    saved = state.get("total_saved", 0)
+    estimated = state.get("time_remaining_seconds")
+    interval = state.get("interval_seconds")
 
-    if state["paused"]:
+    if state.get("waiting_first_sample"):
         st.metric(
-            "⏸️ Tempo restante (pausado)",
-            format_duration(remaining),
+            "⏳ Aguardando 1ª leitura...",
+            format_duration(state.get("duration_seconds")),
         )
+        st.caption(
+            "O cronômetro começa quando chegar a primeira amostra válida."
+        )
+        if target:
+            st.caption(f"Amostras alvo: **{target}**")
+
+    elif state["paused"]:
+        st.metric(
+            "⏸️ Tempo restante (estimado, pausado)",
+            format_duration(estimated),
+        )
+        if target:
+            st.caption(f"Amostras: **{saved} / {target}**")
+
     else:
         st.metric(
-            "⏱️ Tempo restante",
-            format_duration(remaining),
+            "⏱️ Tempo restante (estimado)",
+            format_duration(estimated),
         )
+        if target:
+            st.caption(f"Amostras: **{saved} / {target}**")
 
     if state.get("duration_seconds"):
         st.caption(
-            f"Duração total: {format_duration(state['duration_seconds'])}"
+            f"Duração configurada: "
+            f"{format_duration(state['duration_seconds'])}"
         )
+    if interval:
+        st.caption(f"Intervalo: {interval:g} s")
 
 
 # ============================================================
@@ -606,51 +651,27 @@ with st.sidebar:
     port_options = [p.device for p in ports]
 
     if not port_options:
-        port_options = [
-            "/dev/ttyUSB0",
-            "/dev/ttyACM0"
-        ]
+        port_options = ["/dev/ttyUSB0", "/dev/ttyACM0"]
 
-    selected_port = st.selectbox(
-        "Porta serial",
-        port_options
-    )
+    selected_port = st.selectbox("Porta serial", port_options)
 
     st.caption(
         "Feche o Monitor Serial do PlatformIO antes de conectar."
     )
 
     if not collector.snapshot()["connected"]:
-
         if st.button(
-            "Conectar ESP32",
-            type="primary",
-            width="stretch",
+            "Conectar ESP32", type="primary", width="stretch"
         ):
             try:
-                collector.connect(
-                    selected_port,
-                    115200
-                )
-
-                st.success(
-                    f"Conectado em {selected_port}"
-                )
-
+                collector.connect(selected_port, 115200)
+                st.success(f"Conectado em {selected_port}")
                 st.rerun()
-
             except Exception as exc:
-                st.error(
-                    f"Falha ao conectar: {exc}"
-                )
-
+                st.error(f"Falha ao conectar: {exc}")
     else:
         st.success("ESP32 conectado")
-
-        if st.button(
-            "Desconectar",
-            width="stretch",
-        ):
+        if st.button("Desconectar", width="stretch"):
             collector.disconnect()
             st.rerun()
 
@@ -663,55 +684,59 @@ with st.sidebar:
     st.header("Novo experimento")
 
     exp_name = st.text_input(
-        "Nome",
-        value="Monitoramento do solo"
+        "Nome", value="Monitoramento do solo"
     )
 
     exp_description = st.text_area(
         "Descrição",
-        placeholder="Descreva as condições do experimento..."
+        placeholder="Descreva as condições do experimento...",
     )
 
-    st.markdown("**Duração do experimento**")
+    st.markdown("**Duração de referência**")
 
     dur_cols = st.columns(3)
 
     dur_h = dur_cols[0].number_input(
-        "Horas",
-        min_value=0,
-        max_value=99,
-        value=0,
-        step=1,
-        key="exp_dur_h",
+        "Horas", min_value=0, max_value=99,
+        value=0, step=1, key="exp_dur_h",
     )
     dur_m = dur_cols[1].number_input(
-        "Minutos",
-        min_value=0,
-        max_value=59,
-        value=0,
-        step=1,
-        key="exp_dur_m",
+        "Minutos", min_value=0, max_value=59,
+        value=0, step=1, key="exp_dur_m",
     )
     dur_s = dur_cols[2].number_input(
-        "Segundos",
-        min_value=0,
-        max_value=59,
-        value=10,
-        step=1,
-        key="exp_dur_s",
+        "Segundos", min_value=0, max_value=59,
+        value=10, step=1, key="exp_dur_s",
     )
 
     duration_seconds = dur_h * 3600 + dur_m * 60 + dur_s
 
     st.caption(
-        f"Duração total: {format_duration(duration_seconds)}"
+        f"Duração configurada: {format_duration(duration_seconds)}"
     )
 
     interval = st.number_input(
         "Intervalo configurado no ESP32 (segundos)",
-        min_value=1,
-        value=2,
-        step=1
+        min_value=1, value=2, step=1,
+    )
+
+    # Preview do numero alvo de amostras.
+    if interval > 0 and duration_seconds > 0:
+        preview_target = max(
+            1, int(duration_seconds / interval + 0.5)
+        )
+        preview_real = preview_target * interval
+        st.info(
+            f"**Amostras alvo: {preview_target}**  \n"
+            f"Duração real esperada: ~{preview_real:g} s  \n"
+            f"Critério de parada: contagem de amostras"
+        )
+
+    st.caption(
+        "ℹ️ O cronômetro começa quando a primeira amostra válida "
+        "chegar do ESP32. O experimento encerra sozinho ao atingir "
+        "o número alvo de amostras (garantindo N igual entre "
+        "repetições de mesma duração)."
     )
 
     st.markdown("**Sensores a gravar no CSV**")
@@ -735,13 +760,10 @@ with st.sidebar:
     # --------------------------------------------------------
 
     if collector.snapshot()["recording"]:
-        # Experimento em andamento: substitui o botao pela contagem.
         sidebar_countdown_fragment()
     else:
         if st.button(
-            "Iniciar experimento",
-            type="primary",
-            width="stretch",
+            "Iniciar experimento", type="primary", width="stretch"
         ):
             try:
                 if duration_seconds <= 0:
@@ -752,20 +774,20 @@ with st.sidebar:
                     st.error(
                         "Selecione pelo menos um sensor para gravar."
                     )
+                elif interval <= 0:
+                    st.error(
+                        "O intervalo do ESP32 deve ser maior que zero."
+                    )
                 else:
                     folder = collector.start_experiment(
                         exp_name,
                         exp_description,
                         duration_seconds,
                         sensors_selected,
+                        interval,
                     )
-
-                    st.success(
-                        f"Gravando em: {folder}"
-                    )
-
+                    st.success(f"Gravando em: {folder}")
                     st.rerun()
-
             except Exception as exc:
                 st.error(str(exc))
 
@@ -776,22 +798,12 @@ with st.sidebar:
     state = collector.snapshot()
 
     if state["recording"]:
-
         if state["paused"]:
-
-            if st.button(
-                "Retomar gravação",
-                width="stretch",
-            ):
+            if st.button("Retomar gravação", width="stretch"):
                 collector.resume()
                 st.rerun()
-
         else:
-
-            if st.button(
-                "Pausar gravação",
-                width="stretch",
-            ):
+            if st.button("Pausar gravação", width="stretch"):
                 collector.pause()
                 st.rerun()
 
@@ -801,11 +813,9 @@ with st.sidebar:
             width="stretch",
         ):
             collector.finish()
-
             st.success(
                 "Experimento finalizado e arquivos fechados."
             )
-
             st.rerun()
 
     # --------------------------------------------------------
@@ -818,36 +828,21 @@ with st.sidebar:
     state = collector.snapshot()
 
     if state["recording"]:
-
         st.button(
             "Limpar gráficos",
             disabled=True,
             width="stretch",
-            help=(
-                "Finalize o experimento antes de limpar os gráficos."
-            )
+            help="Finalize o experimento antes de limpar os gráficos.",
         )
-
         st.caption(
-            "A limpeza está disponível somente quando "
-            "não há gravação ativa."
+            "A limpeza está disponível somente quando não há gravação ativa."
         )
-
     else:
-
-        if st.button(
-            "Limpar gráficos",
-            width="stretch",
-        ):
+        if st.button("Limpar gráficos", width="stretch"):
             try:
                 collector.clear_visual_history()
-
-                st.success(
-                    "Histórico visual dos gráficos limpo."
-                )
-
+                st.success("Histórico visual dos gráficos limpo.")
                 st.rerun()
-
             except Exception as exc:
                 st.error(
                     f"Não foi possível limpar os gráficos: {exc}"
@@ -860,20 +855,10 @@ with st.sidebar:
     state = collector.snapshot()
 
     if state["experiment_dir"]:
+        if st.button("Descartar experimento", width="stretch"):
+            st.session_state["confirm_discard_experiment"] = True
 
-        if st.button(
-            "Descartar experimento",
-            width="stretch",
-        ):
-            st.session_state[
-                "confirm_discard_experiment"
-            ] = True
-
-        if st.session_state.get(
-            "confirm_discard_experiment",
-            False
-        ):
-
+        if st.session_state.get("confirm_discard_experiment", False):
             st.warning(
                 "Isso apagará permanentemente a pasta do experimento, "
                 "incluindo dados.csv e metadados.json."
@@ -888,32 +873,19 @@ with st.sidebar:
             ):
                 try:
                     collector.discard_experiment()
-
-                    st.session_state[
-                        "confirm_discard_experiment"
-                    ] = False
-
+                    st.session_state["confirm_discard_experiment"] = False
                     st.success("Experimento descartado.")
-
                     st.rerun()
-
                 except Exception as exc:
                     st.error(
                         f"Não foi possível descartar: {exc}"
                     )
 
-            if cancel_col.button(
-                "Cancelar",
-                width="stretch",
-            ):
-                st.session_state[
-                    "confirm_discard_experiment"
-                ] = False
-
+            if cancel_col.button("Cancelar", width="stretch"):
+                st.session_state["confirm_discard_experiment"] = False
                 st.rerun()
 
     st.divider()
-
     st.caption(
         "Os arquivos ficam na pasta `experimentos/` deste projeto."
     )
@@ -938,23 +910,36 @@ def live_dashboard():
     else:
         st.warning("ESP32 desconectado")
 
-    if data["recording"] and data["paused"]:
-
+    if data["recording"] and data.get("waiting_first_sample"):
+        if data["paused"]:
+            st.info(
+                "Experimento pausado durante a espera pela primeira "
+                "amostra. O cronômetro ainda não iniciou."
+            )
+        else:
+            st.info(
+                "Experimento iniciado. Aguardando a primeira leitura "
+                "válida do ESP32 para começar a contar."
+            )
+    elif data["recording"] and data["paused"]:
         st.info(
-            "Experimento pausado: os dados continuam sendo "
-            "recebidos, mas não são gravados. O cronômetro "
-            "está congelado."
+            "Experimento pausado: os dados continuam sendo recebidos, "
+            "mas não são gravados."
         )
-
     elif data["recording"]:
-
         st.success("Experimento em gravação")
-
     else:
+        st.info("Nenhum experimento está sendo gravado.")
 
-        st.info(
-            "Nenhum experimento está sendo gravado."
-        )
+    # --------------------------------------------------------
+    # PROGRESSO DA GRAVACAO
+    # --------------------------------------------------------
+
+    if data["recording"] and data.get("target_samples"):
+        target = data["target_samples"]
+        saved = data["total_saved"]
+        progress = min(1.0, saved / target) if target > 0 else 0.0
+        st.progress(progress, text=f"Amostras gravadas: {saved} / {target}")
 
     # --------------------------------------------------------
     # LEITURAS ATUAIS
@@ -963,7 +948,6 @@ def live_dashboard():
     values = data["last_values"]
 
     if values:
-
         st.subheader("Leituras atuais (Raw)")
 
         sensor_cols = [
@@ -976,20 +960,13 @@ def live_dashboard():
         ]
 
         cols = st.columns(3)
-
         for idx, (label, key) in enumerate(sensor_cols):
-
-            cols[idx % 3].metric(
-                label,
-                values[key]
-            )
+            cols[idx % 3].metric(label, values[key])
 
         st.caption(
             f"Última leitura recebida: {values['timestamp']}"
         )
-
     else:
-
         st.info(
             "Aguardando a primeira linha válida enviada pelo ESP32..."
         )
@@ -1003,29 +980,19 @@ def live_dashboard():
     history = data["history"]
 
     if history:
-
         df = pd.DataFrame(history)
-
-        df["amostra"] = range(
-            1,
-            len(df) + 1
-        )
+        df["amostra"] = range(1, len(df) + 1)
 
         capacitive_columns = [
             "capacitativo1_raw",
             "capacitativo2_raw",
             "capacitativo3_raw",
         ]
-
         resistive_columns = [
             "resistivo1_raw",
             "resistivo2_raw",
             "resistivo3_raw",
         ]
-
-        # ----------------------------------------------------
-        # SENSORES CAPACITIVOS
-        # ----------------------------------------------------
 
         st.markdown("**Sensores capacitivos**")
 
@@ -1039,29 +1006,16 @@ def live_dashboard():
                 "variable": "Sensor",
             },
         )
-
         fig_cap.for_each_trace(
             lambda trace: trace.update(
-                name=SENSOR_LABELS.get(
-                    trace.name,
-                    trace.name
-                )
+                name=SENSOR_LABELS.get(trace.name, trace.name)
             )
         )
-
         fig_cap.update_layout(
             yaxis_title="Valor Raw",
-            legend_title="Sensor"
+            legend_title="Sensor",
         )
-
-        st.plotly_chart(
-            fig_cap,
-            width="stretch",
-        )
-
-        # ----------------------------------------------------
-        # SENSORES RESISTIVOS
-        # ----------------------------------------------------
+        st.plotly_chart(fig_cap, width="stretch")
 
         st.markdown("**Sensores resistivos**")
 
@@ -1075,28 +1029,17 @@ def live_dashboard():
                 "variable": "Sensor",
             },
         )
-
         fig_res.for_each_trace(
             lambda trace: trace.update(
-                name=SENSOR_LABELS.get(
-                    trace.name,
-                    trace.name
-                )
+                name=SENSOR_LABELS.get(trace.name, trace.name)
             )
         )
-
         fig_res.update_layout(
             yaxis_title="Valor Raw",
-            legend_title="Sensor"
+            legend_title="Sensor",
         )
-
-        st.plotly_chart(
-            fig_res,
-            width="stretch",
-        )
-
+        st.plotly_chart(fig_res, width="stretch")
     else:
-
         st.info(
             "Os gráficos aparecerão assim que chegarem leituras válidas."
         )
@@ -1107,16 +1050,13 @@ def live_dashboard():
 
     st.subheader("Estado da gravação")
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
 
-    c1.metric(
-        "Linhas recebidas",
-        data["total_received"]
-    )
-
-    c2.metric(
-        "Linhas gravadas",
-        data["total_saved"]
+    c1.metric("Linhas recebidas", data["total_received"])
+    c2.metric("Linhas gravadas", data["total_saved"])
+    c3.metric(
+        "Amostras alvo",
+        data["target_samples"] if data.get("target_samples") else "—",
     )
 
     if data["recording"] and data["sensors_selected"]:
@@ -1128,11 +1068,7 @@ def live_dashboard():
         )
 
     if data["experiment_dir"]:
-
-        st.code(
-            data["experiment_dir"],
-            language=None
-        )
+        st.code(data["experiment_dir"], language=None)
 
 
 # ============================================================
@@ -1140,7 +1076,6 @@ def live_dashboard():
 # ============================================================
 
 def _list_experiments():
-    """Lista pastas em EXPERIMENTS_DIR que contenham dados.csv."""
     if not EXPERIMENTS_DIR.exists():
         return []
     result = [
@@ -1152,7 +1087,6 @@ def _list_experiments():
 
 
 def _load_experiment(folder):
-    """Carrega dados.csv e metadados.json de uma pasta de experimento."""
     df = pd.read_csv(folder / "dados.csv")
     meta = None
     meta_path = folder / "metadados.json"
@@ -1165,7 +1099,6 @@ def _load_experiment(folder):
 
 
 def _format_experiment_label(folder, meta=None):
-    """Rotulo amigavel para o selectbox."""
     if meta is None:
         meta_path = folder / "metadados.json"
         if meta_path.exists():
@@ -1184,12 +1117,10 @@ def _format_experiment_label(folder, meta=None):
             except Exception:
                 pass
         return nome
-
     return folder.name
 
 
 def _sensors_in_df(df):
-    """Sensores conhecidos que existem como colunas no DataFrame."""
     return [c for c in SENSOR_COLUMNS if c in df.columns]
 
 
@@ -1204,29 +1135,18 @@ def _x_axis_label(x):
 def _plot_line(df, x, columns, title=None):
     if not columns:
         return None
-
     fig = px.line(df, x=x, y=columns)
-
     fig.for_each_trace(
-        lambda t: t.update(
-            name=SENSOR_LABELS.get(t.name, t.name)
-        )
+        lambda t: t.update(name=SENSOR_LABELS.get(t.name, t.name))
     )
-
     fig.update_layout(
         title=title,
         yaxis_title="Valor Raw",
         legend_title="Sensor",
         xaxis_title=_x_axis_label(x),
         uirevision="constante",
-        margin=dict(
-            l=10,
-            r=10,
-            t=40 if title else 10,
-            b=10,
-        ),
+        margin=dict(l=10, r=10, t=40 if title else 10, b=10),
     )
-
     return fig
 
 
@@ -1248,7 +1168,6 @@ def render_analysis_tab():
         )
         return
 
-    # ---- Navegacao: selecao de pasta ----
     folder_names = [p.name for p in experiments]
     labels_map = {
         p.name: _format_experiment_label(p)
@@ -1263,7 +1182,6 @@ def render_analysis_tab():
     )
 
     folder = EXPERIMENTS_DIR / selected_folder_name
-
     if not folder.exists():
         st.warning(
             "A pasta selecionada não existe mais. "
@@ -1291,18 +1209,48 @@ def render_analysis_tab():
                 f"**Nome:** {meta.get('nome', '—')}\n\n"
                 f"**Início:** {meta.get('inicio', '—')}\n\n"
                 f"**Fim:** {meta.get('fim', '—')}\n\n"
-                f"**Status:** {meta.get('status', '—')}"
+                f"**Status:** {meta.get('status', '—')}\n\n"
+                f"**t0 (1ª amostra):** "
+                f"{meta.get('t0_primeira_amostra', '—')}\n\n"
+                f"**tN (última amostra):** "
+                f"{meta.get('tN_ultima_amostra', '—')}"
             )
             mcol2.markdown(
                 f"**Duração configurada:** "
                 f"{format_duration(meta.get('duracao_configurada_segundos'))}\n\n"
-                f"**Porta:** {meta.get('porta_serial', '—')}\n\n"
-                f"**Baud:** {meta.get('baud_rate', '—')}"
+                f"**Duração real:** "
+                f"{meta.get('duracao_real_segundos', '—')} s\n\n"
+                f"**Amostras alvo:** "
+                f"{meta.get('amostras_alvo', '—')}\n\n"
+                f"**Amostras gravadas:** "
+                f"{meta.get('amostras_gravadas', '—')}\n\n"
+                f"**Intervalo configurado:** "
+                f"{meta.get('intervalo_configurado_segundos', '—')} s\n\n"
+                f"**Porta:** {meta.get('porta_serial', '—')}"
             )
             if meta.get("descricao"):
                 st.markdown(f"**Descrição:** {meta['descricao']}")
 
-    # ---- Sensores disponiveis no CSV ----
+            st.markdown("**Intervalo medido (tempo_esp_ms)**")
+            ic1, ic2, ic3, ic4 = st.columns(4)
+            ic1.metric(
+                "Média (ms)",
+                meta.get("intervalo_medido_ms_media", "—"),
+            )
+            ic2.metric(
+                "Desvio-padrão (ms)",
+                meta.get("intervalo_medido_ms_dp", "—"),
+            )
+            ic3.metric(
+                "Mínimo (ms)",
+                meta.get("intervalo_medido_ms_min", "—"),
+            )
+            ic4.metric(
+                "Máximo (ms)",
+                meta.get("intervalo_medido_ms_max", "—"),
+            )
+
+    # ---- Sensores disponiveis ----
     available_sensors = _sensors_in_df(df)
     if not available_sensors:
         st.warning(
@@ -1315,7 +1263,6 @@ def render_analysis_tab():
         f"colunas: {', '.join(df.columns.tolist())}"
     )
 
-    # ---- Preparar eixo X ----
     df = df.copy()
     df["amostra"] = range(1, len(df) + 1)
 
@@ -1333,7 +1280,6 @@ def render_analysis_tab():
             pass
     x_candidates.append("amostra")
 
-    # ---- Controles ----
     ctrl_mode, ctrl_x, ctrl_sensors = st.columns([1.2, 1, 1.6])
 
     mode = ctrl_mode.radio(
@@ -1365,7 +1311,6 @@ def render_analysis_tab():
         st.warning("Selecione pelo menos um sensor.")
         return
 
-    # ---- Opcoes avancadas ----
     with st.expander("⚙️ Opções avançadas", expanded=False):
         max_points = st.number_input(
             "Máximo de pontos por gráfico (0 = todos)",
@@ -1384,7 +1329,6 @@ def render_analysis_tab():
             f"(1 a cada {step} pontos)."
         )
 
-    # ---- Estatisticas ----
     with st.expander("📊 Estatísticas dos sensores", expanded=False):
         stats_rows = []
         for col in selected_sensors:
@@ -1402,7 +1346,6 @@ def render_analysis_tab():
             hide_index=True,
         )
 
-    # ---- Plotagem ----
     st.subheader("Gráficos")
 
     if mode == "Todos os sensores juntos":
@@ -1411,12 +1354,10 @@ def render_analysis_tab():
 
     elif mode == "Por tipo (capacitivo/resistivo)":
         cap_cols = [
-            c for c in selected_sensors
-            if c.startswith("capacitativo")
+            c for c in selected_sensors if c.startswith("capacitativo")
         ]
         res_cols = [
-            c for c in selected_sensors
-            if c.startswith("resistivo")
+            c for c in selected_sensors if c.startswith("resistivo")
         ]
 
         if cap_cols:
@@ -1431,15 +1372,12 @@ def render_analysis_tab():
                 _plot_line(df_plot, x_axis, res_cols),
                 width="stretch",
             )
-
-    else:  # Um gráfico por sensor
+    else:
         cols = st.columns(2)
         for i, sensor in enumerate(selected_sensors):
             with cols[i % 2]:
                 fig = _plot_line(
-                    df_plot,
-                    x_axis,
-                    [sensor],
+                    df_plot, x_axis, [sensor],
                     title=SENSOR_LABELS.get(sensor, sensor),
                 )
                 st.plotly_chart(

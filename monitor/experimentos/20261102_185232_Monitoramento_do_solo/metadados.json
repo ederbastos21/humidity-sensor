@@ -1,0 +1,25 @@
+{
+    "nome": "Monitoramento do solo",
+    "descricao": "",
+    "inicio": "2026-11-02T18:52:32-03:00",
+    "fim": "2026-11-02T18:52:53-03:00",
+    "status": "finalizado_por_tempo",
+    "porta_serial": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "intervalo_configurado_esp_ms": null,
+    "intervalo_exibido_segundos": null,
+    "duracao_configurada_segundos": 20,
+    "sensores_selecionados": [
+        "capacitativo3_raw",
+        "resistivo1_raw"
+    ],
+    "sensores_disponiveis": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw",
+        "resistivo1_raw",
+        "resistivo2_raw",
+        "resistivo3_raw"
+    ],
+    "observacao": "Valores Raw originais do ADS1115; calibracao ainda nao aplicada. O cronometro inicia na primeira amostra gravada."
+}
