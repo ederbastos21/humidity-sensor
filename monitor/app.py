@@ -1,11 +1,10 @@
-
 import atexit
 import csv
 import json
 import shutil
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -19,9 +18,12 @@ BASE_DIR = Path(__file__).resolve().parent
 EXPERIMENTS_DIR = BASE_DIR / "experimentos"
 EXPERIMENTS_DIR.mkdir(exist_ok=True)
 
-CSV_COLUMNS = [
+BASE_COLUMNS = [
     "timestamp",
     "tempo_esp_ms",
+]
+
+SENSOR_COLUMNS = [
     "capacitativo1_raw",
     "capacitativo2_raw",
     "capacitativo3_raw",
@@ -29,6 +31,28 @@ CSV_COLUMNS = [
     "resistivo2_raw",
     "resistivo3_raw",
 ]
+
+SENSOR_LABELS = {
+    "capacitativo1_raw": "Capacitivo 1",
+    "capacitativo2_raw": "Capacitivo 2",
+    "capacitativo3_raw": "Capacitivo 3",
+    "resistivo1_raw": "Resistivo 1",
+    "resistivo2_raw": "Resistivo 2",
+    "resistivo3_raw": "Resistivo 3",
+}
+
+CSV_COLUMNS = BASE_COLUMNS + SENSOR_COLUMNS
+
+
+def format_duration(seconds):
+    """Formata segundos em HH:MM:SS. Aceita None (retorna '—')."""
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(round(seconds)))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 class SerialCollector:
@@ -44,6 +68,7 @@ class SerialCollector:
         self.paused = False
         self.file_handle = None
         self.csv_writer = None
+        self.csv_fieldnames = list(CSV_COLUMNS)
         self.experiment_dir = None
         self.metadata = None
         self.last_values = None
@@ -52,6 +77,13 @@ class SerialCollector:
         self.total_received = 0
         self.total_saved = 0
         self.history = deque(maxlen=600)
+
+        # Controle de duracao
+        self.end_time = None
+        self.paused_remaining = None
+        self.duration_seconds = None
+        self.sensors_selected = list(SENSOR_COLUMNS)
+        self._timer = None
 
     def connect(self, port, baud=115200):
         with self.lock:
@@ -163,6 +195,8 @@ class SerialCollector:
                     self.history.append(row)
 
                     # Gravacao CSV independente do historico visual.
+                    # extrasaction="ignore" faz o DictWriter descartar
+                    # automaticamente as colunas nao selecionadas.
                     if self.recording and not self.paused and self.csv_writer:
                         self.csv_writer.writerow(row)
                         self.file_handle.flush()
@@ -184,13 +218,48 @@ class SerialCollector:
 
                 break
 
-    def start_experiment(self, name, description, interval_seconds):
+    def _schedule_timer(self, seconds):
+        """Agenda a finalizacao automatica do experimento."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if seconds is None or seconds <= 0:
+            return
+        timer = threading.Timer(seconds, self._on_timer_expire)
+        timer.daemon = True
+        self._timer = timer
+        timer.start()
+
+    def _on_timer_expire(self):
+        with self.lock:
+            self._timer = None
+            # Se o usuario pausou exatamente agora, nao finaliza.
+            if not self.recording or self.paused:
+                return
+            self._close_experiment_locked("finalizado_por_tempo")
+
+    def start_experiment(self, name, description, duration_seconds, sensors_selected):
         with self.lock:
             if not self.connected:
                 raise RuntimeError("Conecte o ESP32 antes de iniciar.")
 
             if self.recording:
                 raise RuntimeError("Ja existe um experimento em andamento.")
+
+            if duration_seconds is None or duration_seconds <= 0:
+                raise RuntimeError(
+                    "A duração do experimento deve ser maior que zero."
+                )
+
+            # Filtra a selecao pelos nomes canonicos conhecidos.
+            selected = [
+                s for s in SENSOR_COLUMNS
+                if s in (sensors_selected or [])
+            ]
+            if not selected:
+                raise RuntimeError(
+                    "Selecione pelo menos um sensor para gravar."
+                )
 
             now = datetime.now().astimezone()
 
@@ -219,9 +288,13 @@ class SerialCollector:
                 encoding="utf-8"
             )
 
+            # Header dinamico: base + apenas os sensores selecionados.
+            self.csv_fieldnames = BASE_COLUMNS + selected
+
             self.csv_writer = csv.DictWriter(
                 self.file_handle,
-                fieldnames=CSV_COLUMNS
+                fieldnames=self.csv_fieldnames,
+                extrasaction="ignore",
             )
 
             self.csv_writer.writeheader()
@@ -238,15 +311,10 @@ class SerialCollector:
                 "porta_serial": self.serial_conn.port,
                 "baud_rate": 115200,
                 "intervalo_configurado_esp_ms": None,
-                "intervalo_exibido_segundos": interval_seconds,
-                "sensores": [
-                    "capacitativo1",
-                    "capacitativo2",
-                    "capacitativo3",
-                    "resistivo1",
-                    "resistivo2",
-                    "resistivo3"
-                ],
+                "intervalo_exibido_segundos": None,
+                "duracao_configurada_segundos": int(duration_seconds),
+                "sensores_selecionados": list(selected),
+                "sensores_disponiveis": list(SENSOR_COLUMNS),
                 "observacao": (
                     "Valores Raw originais do ADS1115; "
                     "calibracao ainda nao aplicada."
@@ -258,20 +326,55 @@ class SerialCollector:
             self.recording = True
             self.paused = False
             self.total_saved = 0
+            self.sensors_selected = selected
+            self.duration_seconds = duration_seconds
+            self.end_time = now + timedelta(seconds=duration_seconds)
+            self.paused_remaining = None
+
+            self._schedule_timer(duration_seconds)
 
             return folder
 
     def pause(self):
         with self.lock:
-            if self.recording:
+            if self.recording and not self.paused:
                 self.paused = True
+
+                # Congela o cronometro: guarda o quanto falta e cancela o timer.
+                if self._timer is not None:
+                    self._timer.cancel()
+                    self._timer = None
+
+                if self.end_time is not None:
+                    self.paused_remaining = max(
+                        0.0,
+                        (
+                            self.end_time - datetime.now().astimezone()
+                        ).total_seconds()
+                    )
+
                 self.metadata["status"] = "pausado"
                 self._write_metadata_locked()
 
     def resume(self):
         with self.lock:
-            if self.recording:
+            if self.recording and self.paused:
                 self.paused = False
+
+                if self.paused_remaining is not None:
+                    if self.paused_remaining > 0:
+                        self.end_time = (
+                            datetime.now().astimezone()
+                            + timedelta(seconds=self.paused_remaining)
+                        )
+                        self._schedule_timer(self.paused_remaining)
+                    else:
+                        # Nao havia tempo restante: finaliza imediatamente.
+                        self.paused_remaining = None
+                        self._close_experiment_locked("finalizado_por_tempo")
+                        return
+
+                self.paused_remaining = None
                 self.metadata["status"] = "em_andamento"
                 self._write_metadata_locked()
 
@@ -331,6 +434,14 @@ class SerialCollector:
             temp_path.replace(path)
 
     def _close_experiment_locked(self, final_status):
+        # Cancela o timer caso ainda exista.
+        if self._timer is not None:
+            try:
+                self._timer.cancel()
+            except Exception:
+                pass
+            self._timer = None
+
         if self.file_handle:
             try:
                 self.file_handle.flush()
@@ -353,9 +464,23 @@ class SerialCollector:
 
         self.recording = False
         self.paused = False
+        self.end_time = None
+        self.paused_remaining = None
 
     def snapshot(self):
         with self.lock:
+            time_remaining = None
+            if self.recording:
+                if self.paused and self.paused_remaining is not None:
+                    time_remaining = self.paused_remaining
+                elif not self.paused and self.end_time is not None:
+                    time_remaining = max(
+                        0.0,
+                        (
+                            self.end_time - datetime.now().astimezone()
+                        ).total_seconds()
+                    )
+
             return {
                 "connected": self.connected,
                 "recording": self.recording,
@@ -375,6 +500,9 @@ class SerialCollector:
                     if self.metadata
                     else None
                 ),
+                "time_remaining_seconds": time_remaining,
+                "duration_seconds": self.duration_seconds,
+                "sensors_selected": list(self.sensors_selected),
             }
 
 
@@ -413,6 +541,57 @@ def get_collector():
 
 
 collector = get_collector()
+
+
+def _rerun_app():
+    """
+    Forca um rerun completo do app (nao apenas do fragmento atual).
+
+    Necessario para que o botao "Iniciar experimento" volte a aparecer
+    no sidebar quando o experimento terminar por tempo enquanto o usuario
+    esta ocioso. Usa fallback para versoes antigas do Streamlit onde o
+    parametro `scope` ainda nao existe (nessas versoes, st.rerun() ja
+    rerenderizava o app inteiro).
+    """
+    try:
+        st.rerun(scope="app")
+    except TypeError:
+        st.rerun()
+
+
+@st.fragment(run_every=1)
+def sidebar_countdown_fragment():
+    """
+    Contagem regressiva do experimento em andamento, exibida no lugar
+    do botao "Iniciar experimento" dentro do menu "Novo experimento".
+    """
+    state = collector.snapshot()
+
+    if not state["recording"]:
+        # O experimento terminou enquanto este fragmento estava ativo
+        # (provavelmente por tempo, via timer em background). Forca um
+        # rerun completo para que o botao "Iniciar experimento" volte
+        # a aparecer no sidebar.
+        _rerun_app()
+        return
+
+    remaining = state["time_remaining_seconds"]
+
+    if state["paused"]:
+        st.metric(
+            "⏸️ Tempo restante (pausado)",
+            format_duration(remaining),
+        )
+    else:
+        st.metric(
+            "⏱️ Tempo restante",
+            format_duration(remaining),
+        )
+
+    if state.get("duration_seconds"):
+        st.caption(
+            f"Duração total: {format_duration(state['duration_seconds'])}"
+        )
 
 
 # ============================================================
@@ -493,6 +672,41 @@ with st.sidebar:
         placeholder="Descreva as condições do experimento..."
     )
 
+    st.markdown("**Duração do experimento**")
+
+    dur_cols = st.columns(3)
+
+    dur_h = dur_cols[0].number_input(
+        "Horas",
+        min_value=0,
+        max_value=99,
+        value=0,
+        step=1,
+        key="exp_dur_h",
+    )
+    dur_m = dur_cols[1].number_input(
+        "Minutos",
+        min_value=0,
+        max_value=59,
+        value=0,
+        step=1,
+        key="exp_dur_m",
+    )
+    dur_s = dur_cols[2].number_input(
+        "Segundos",
+        min_value=0,
+        max_value=59,
+        value=10,
+        step=1,
+        key="exp_dur_s",
+    )
+
+    duration_seconds = dur_h * 3600 + dur_m * 60 + dur_s
+
+    st.caption(
+        f"Duração total: {format_duration(duration_seconds)}"
+    )
+
     interval = st.number_input(
         "Intervalo configurado no ESP32 (segundos)",
         min_value=1,
@@ -500,26 +714,60 @@ with st.sidebar:
         step=1
     )
 
-    if st.button(
-        "Iniciar experimento",
-        type="primary",
-        use_container_width=True
-    ):
-        try:
-            folder = collector.start_experiment(
-                exp_name,
-                exp_description,
-                interval
-            )
+    st.markdown("**Sensores a gravar no CSV**")
 
-            st.success(
-                f"Gravando em: {folder}"
-            )
+    sensors_selected = []
+    for sensor_key in SENSOR_COLUMNS:
+        if st.checkbox(
+            SENSOR_LABELS[sensor_key],
+            value=True,
+            key=f"sensor_cb_{sensor_key}",
+        ):
+            sensors_selected.append(sensor_key)
 
-            st.rerun()
+    if not sensors_selected:
+        st.warning(
+            "Marque pelo menos um sensor para poder iniciar o experimento."
+        )
 
-        except Exception as exc:
-            st.error(str(exc))
+    # --------------------------------------------------------
+    # BOTAO DE INICIAR **OU** CONTAGEM REGRESSIVA
+    # --------------------------------------------------------
+
+    if collector.snapshot()["recording"]:
+        # Experimento em andamento: substitui o botao pela contagem.
+        sidebar_countdown_fragment()
+    else:
+        if st.button(
+            "Iniciar experimento",
+            type="primary",
+            use_container_width=True
+        ):
+            try:
+                if duration_seconds <= 0:
+                    st.error(
+                        "Defina uma duração maior que zero (h/m/s)."
+                    )
+                elif not sensors_selected:
+                    st.error(
+                        "Selecione pelo menos um sensor para gravar."
+                    )
+                else:
+                    folder = collector.start_experiment(
+                        exp_name,
+                        exp_description,
+                        duration_seconds,
+                        sensors_selected,
+                    )
+
+                    st.success(
+                        f"Gravando em: {folder}"
+                    )
+
+                    st.rerun()
+
+            except Exception as exc:
+                st.error(str(exc))
 
     # --------------------------------------------------------
     # CONTROLE DA GRAVACAO
@@ -694,7 +942,8 @@ def live_dashboard():
 
         st.info(
             "Experimento pausado: os dados continuam sendo "
-            "recebidos, mas não são gravados."
+            "recebidos, mas não são gravados. O cronômetro "
+            "está congelado."
         )
 
     elif data["recording"]:
@@ -774,15 +1023,6 @@ def live_dashboard():
             "resistivo3_raw",
         ]
 
-        sensor_labels = {
-            "capacitativo1_raw": "Capacitivo 1",
-            "capacitativo2_raw": "Capacitivo 2",
-            "capacitativo3_raw": "Capacitivo 3",
-            "resistivo1_raw": "Resistivo 1",
-            "resistivo2_raw": "Resistivo 2",
-            "resistivo3_raw": "Resistivo 3",
-        }
-
         # ----------------------------------------------------
         # SENSORES CAPACITIVOS
         # ----------------------------------------------------
@@ -802,7 +1042,7 @@ def live_dashboard():
 
         fig_cap.for_each_trace(
             lambda trace: trace.update(
-                name=sensor_labels.get(
+                name=SENSOR_LABELS.get(
                     trace.name,
                     trace.name
                 )
@@ -838,7 +1078,7 @@ def live_dashboard():
 
         fig_res.for_each_trace(
             lambda trace: trace.update(
-                name=sensor_labels.get(
+                name=SENSOR_LABELS.get(
                     trace.name,
                     trace.name
                 )
@@ -863,6 +1103,7 @@ def live_dashboard():
 
     # --------------------------------------------------------
     # ESTADO DA GRAVACAO
+    # (contagem removida: agora só existe no sidebar)
     # --------------------------------------------------------
 
     st.subheader("Estado da gravação")
@@ -878,6 +1119,14 @@ def live_dashboard():
         "Linhas gravadas",
         data["total_saved"]
     )
+
+    if data["recording"] and data["sensors_selected"]:
+        st.caption(
+            "Sensores sendo gravados no CSV: "
+            + ", ".join(
+                SENSOR_LABELS[s] for s in data["sensors_selected"]
+            )
+        )
 
     if data["experiment_dir"]:
 

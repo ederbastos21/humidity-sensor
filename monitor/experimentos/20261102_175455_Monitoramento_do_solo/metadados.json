@@ -1,0 +1,20 @@
+{
+    "nome": "Monitoramento do solo",
+    "descricao": "",
+    "inicio": "2026-11-02T17:54:55-03:00",
+    "fim": "2026-11-02T17:57:29-03:00",
+    "status": "interrompido",
+    "porta_serial": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "intervalo_configurado_esp_ms": null,
+    "intervalo_exibido_segundos": 2,
+    "sensores": [
+        "capacitativo1",
+        "capacitativo2",
+        "capacitativo3",
+        "resistivo1",
+        "resistivo2",
+        "resistivo3"
+    ],
+    "observacao": "Valores Raw originais do ADS1115; calibracao ainda nao aplicada."
+}
