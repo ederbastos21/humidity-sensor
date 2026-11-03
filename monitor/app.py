@@ -227,7 +227,6 @@ class SerialCollector:
                             self._close_experiment_locked(
                                 "finalizado_por_amostras"
                             )
-                            break
 
             except (ValueError, UnicodeDecodeError):
                 continue

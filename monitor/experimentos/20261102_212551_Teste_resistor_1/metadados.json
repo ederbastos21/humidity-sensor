@@ -1,0 +1,35 @@
+{
+    "nome": "Teste resistor 1",
+    "descricao": "sensor 1 - farinha de rosca\nsensor 2 - achocolatado\nsensor 3 - farinha de mandioca",
+    "inicio": "2026-11-02T21:25:51-03:00",
+    "fim": "2026-11-02T21:30:51-03:00",
+    "t0_primeira_amostra": "2026-11-02T21:25:53-03:00",
+    "tN_ultima_amostra": "2026-11-02T21:30:51-03:00",
+    "duracao_configurada_segundos": 300,
+    "duracao_real_segundos": 297.993,
+    "intervalo_configurado_segundos": 2.0,
+    "amostras_alvo": 150,
+    "amostras_gravadas": 150,
+    "intervalo_medido_ms_media": 2000.0,
+    "intervalo_medido_ms_dp": 0.0,
+    "intervalo_medido_ms_min": 2000,
+    "intervalo_medido_ms_max": 2000,
+    "intervalo_medido_deltas_n": 149,
+    "status": "finalizado_por_amostras",
+    "porta_serial": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "sensores_selecionados": [
+        "resistivo1_raw",
+        "resistivo2_raw",
+        "resistivo3_raw"
+    ],
+    "sensores_disponiveis": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw",
+        "resistivo1_raw",
+        "resistivo2_raw",
+        "resistivo3_raw"
+    ],
+    "observacao": "Valores Raw originais do ADS1115; calibracao ainda nao aplicada. Criterio de parada: contagem de amostras (duracao / intervalo)."
+}
