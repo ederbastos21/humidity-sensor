@@ -34,16 +34,46 @@ SENSOR_COLUMNS = [
 
 SENSOR_LABELS = {
     "capacitativo1_raw": "Capacitivo 1",
-    "capacitativo2_raw": "Capacitativo 2",
-    "capacitativo3_raw": "Capacitativo 3",
+    "capacitativo2_raw": "Capacitivo 2",
+    "capacitativo3_raw": "Capacitivo 3",
     "resistivo1_raw": "Resistivo 1",
     "resistivo2_raw": "Resistivo 2",
     "resistivo3_raw": "Resistivo 3",
 }
 
-SENSOR_LABELS["capacitativo3_raw"] = "Capacitivo 3"
-
 CSV_COLUMNS = BASE_COLUMNS + SENSOR_COLUMNS
+
+# Tamanhos de fonte dos gráficos (em px). Ajuste aqui para aumentar/diminuir.
+CHART_FONT_BASE = 16        # texto geral e caixa de hover
+CHART_FONT_TICKS = 16       # números dos eixos
+CHART_FONT_AXIS_TITLE = 18  # títulos dos eixos
+CHART_FONT_LEGEND = 16      # legenda
+CHART_FONT_TITLE = 22       # título do gráfico (modo "um gráfico por sensor")
+
+# Avisos exibidos quando um experimento termina: status -> (nível, texto)
+FINISH_MESSAGES = {
+    "finalizado_por_amostras": (
+        "success",
+        "Teste concluído: o número alvo de amostras foi atingido.",
+    ),
+    "finalizado": (
+        "success",
+        "Teste finalizado manualmente.",
+    ),
+    "finalizado_por_failsafe": (
+        "warning",
+        "Teste encerrado pelo limite de segurança de tempo (failsafe) "
+        "antes de atingir o número alvo de amostras. Confira os dados.",
+    ),
+    "interrompido": (
+        "warning",
+        "Teste interrompido: o ESP32 foi desconectado durante a gravação.",
+    ),
+    "interrompido_por_erro_serial": (
+        "error",
+        "Teste interrompido por erro na comunicação serial.",
+    ),
+}
 
 
 def format_duration(seconds):
@@ -55,6 +85,16 @@ def format_duration(seconds):
     m = (seconds % 3600) // 60
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def sensor_display_name(sensor_key, condition=None):
+    """Nome do sensor para exibir nos gráficos, com a condição de referência.
+
+    Ex.: "Capacitivo 1 (compactação x)". Sem condição, só o nome do sensor.
+    """
+    base = SENSOR_LABELS.get(sensor_key, sensor_key)
+    condition = (condition or "").strip()
+    return f"{base} ({condition})" if condition else base
 
 
 class SerialCollector:
@@ -94,6 +134,18 @@ class SerialCollector:
         self.sensors_selected = list(SENSOR_COLUMNS)
         self._timer = None
 
+        # Tempo de pausa (espera antes de comecar a gravar)
+        self.delay_seconds = 0
+        self._delay_deadline = None
+        self._delay_remaining = None  # congelado enquanto a gravacao esta pausada
+
+        # Condicao de referencia (exibida nos graficos junto ao nome do sensor)
+        self.reference_condition = ""
+
+        # Ultimo experimento encerrado (usado para avisar o usuario)
+        self.finished_event = None
+        self._event_counter = 0
+
     def connect(self, port, baud=115200):
         with self.lock:
             if self.connected:
@@ -130,10 +182,15 @@ class SerialCollector:
     def disconnect(self):
         with self.lock:
             self.running = False
+
+            # Só encerra (e marca como interrompido) se havia gravação ativa.
+            # Antes, desconectar depois de um experimento finalizado
+            # sobrescrevia o status dele nos metadados.
+            if self.recording:
+                self._close_experiment_locked("interrompido")
+
             self.recording = False
             self.paused = False
-            self._close_experiment_locked("interrompido")
-
             self.connected = False
             thread = self.thread
             self.thread = None
@@ -190,6 +247,13 @@ class SerialCollector:
                     self.history.append(row)
 
                     if self.recording and not self.paused and self.csv_writer:
+                        # Tempo de pausa: os dados chegam (e aparecem nos
+                        # graficos), mas nada e gravado ate o prazo acabar.
+                        if self._delay_deadline is not None:
+                            if received_at < self._delay_deadline:
+                                continue
+                            self._delay_deadline = None
+
                         if self.waiting_first_sample:
                             self.waiting_first_sample = False
                             self.t0 = received_at
@@ -237,6 +301,10 @@ class SerialCollector:
                         self.last_error = str(exc)
                         self.running = False
                         self.connected = False
+                        if self.recording:
+                            self._close_experiment_locked(
+                                "interrompido_por_erro_serial"
+                            )
                         self._close_port_locked()
                 break
 
@@ -259,7 +327,8 @@ class SerialCollector:
             self._close_experiment_locked("finalizado_por_failsafe")
 
     def start_experiment(self, name, description, duration_seconds,
-                         sensors_selected, interval_seconds):
+                         sensors_selected, interval_seconds,
+                         delay_seconds=0, reference_condition=""):
         with self.lock:
             if not self.connected:
                 raise RuntimeError("Conecte o ESP32 antes de iniciar.")
@@ -273,6 +342,14 @@ class SerialCollector:
                 raise RuntimeError(
                     "O intervalo do ESP32 deve ser maior que zero."
                 )
+
+            delay_seconds = int(delay_seconds or 0)
+            if delay_seconds < 0:
+                raise RuntimeError(
+                    "O tempo de pausa não pode ser negativo."
+                )
+
+            reference_condition = (reference_condition or "").strip()
 
             selected = [
                 s for s in SENSOR_COLUMNS
@@ -315,10 +392,12 @@ class SerialCollector:
             self.metadata = {
                 "nome": name.strip() or "Experimento",
                 "descricao": description.strip(),
+                "condicao_referencia": reference_condition,
                 "inicio": now.isoformat(timespec="seconds"),
                 "fim": None,
                 "t0_primeira_amostra": None,
                 "tN_ultima_amostra": None,
+                "tempo_pausa_configurado_segundos": int(delay_seconds),
                 "duracao_configurada_segundos": int(duration_seconds),
                 "duracao_real_segundos": None,
                 "intervalo_configurado_segundos": float(interval_seconds),
@@ -329,7 +408,11 @@ class SerialCollector:
                 "intervalo_medido_ms_min": None,
                 "intervalo_medido_ms_max": None,
                 "intervalo_medido_deltas_n": 0,
-                "status": "aguardando_primeira_amostra",
+                "status": (
+                    "em_tempo_de_pausa"
+                    if delay_seconds > 0
+                    else "aguardando_primeira_amostra"
+                ),
                 "porta_serial": self.serial_conn.port,
                 "baud_rate": 115200,
                 "sensores_selecionados": list(selected),
@@ -358,6 +441,16 @@ class SerialCollector:
             self._failsafe_deadline = None
             self._failsafe_remaining = None
 
+            self.delay_seconds = delay_seconds
+            self._delay_remaining = None
+            self._delay_deadline = (
+                now + timedelta(seconds=delay_seconds)
+                if delay_seconds > 0
+                else None
+            )
+            self.reference_condition = reference_condition
+            self.finished_event = None
+
             return folder
 
     def pause(self):
@@ -374,6 +467,16 @@ class SerialCollector:
                         0.0,
                         (
                             self._failsafe_deadline
+                            - datetime.now().astimezone()
+                        ).total_seconds(),
+                    )
+
+                # Congela o que ainda falta do tempo de pausa.
+                if self._delay_deadline is not None:
+                    self._delay_remaining = max(
+                        0.0,
+                        (
+                            self._delay_deadline
                             - datetime.now().astimezone()
                         ).total_seconds(),
                     )
@@ -398,7 +501,17 @@ class SerialCollector:
 
                 self._failsafe_remaining = None
 
-                if self.waiting_first_sample:
+                # Retoma a contagem do tempo de pausa de onde parou.
+                if self._delay_remaining is not None:
+                    self._delay_deadline = (
+                        datetime.now().astimezone()
+                        + timedelta(seconds=self._delay_remaining)
+                    )
+                    self._delay_remaining = None
+
+                if self._delay_deadline is not None:
+                    self.metadata["status"] = "em_tempo_de_pausa"
+                elif self.waiting_first_sample:
                     self.metadata["status"] = "aguardando_primeira_amostra"
                 else:
                     self.metadata["status"] = "em_andamento"
@@ -423,6 +536,7 @@ class SerialCollector:
             self.metadata = None
             self.file_handle = None
             self.csv_writer = None
+            self.finished_event = None
 
     def clear_visual_history(self):
         with self.lock:
@@ -443,6 +557,8 @@ class SerialCollector:
             temp_path.replace(path)
 
     def _close_experiment_locked(self, final_status):
+        was_recording = self.recording
+
         if self._timer is not None:
             try:
                 self._timer.cancel()
@@ -499,6 +615,24 @@ class SerialCollector:
         self.waiting_first_sample = False
         self._failsafe_deadline = None
         self._failsafe_remaining = None
+        self._delay_deadline = None
+        self._delay_remaining = None
+
+        # Registra o fim do teste para a interface avisar o usuario.
+        if was_recording and final_status != "descartado":
+            self._event_counter += 1
+            meta = self.metadata or {}
+            self.finished_event = {
+                "id": self._event_counter,
+                "status": final_status,
+                "nome": meta.get("nome"),
+                "amostras_gravadas": int(self.total_saved),
+                "amostras_alvo": self.target_samples,
+                "duracao_real_segundos": meta.get("duracao_real_segundos"),
+                "pasta": (
+                    str(self.experiment_dir) if self.experiment_dir else None
+                ),
+            }
 
     def snapshot(self):
         with self.lock:
@@ -515,11 +649,30 @@ class SerialCollector:
                             samples_remaining * self.interval_seconds
                         )
 
+            # Tempo de pausa restante (None se nao ha tempo de pausa ativo)
+            in_delay = False
+            delay_remaining = None
+            if self.recording and self.delay_seconds > 0:
+                if self.paused and self._delay_remaining is not None:
+                    delay_remaining = self._delay_remaining
+                elif self._delay_deadline is not None:
+                    delay_remaining = max(
+                        0.0,
+                        (
+                            self._delay_deadline
+                            - datetime.now().astimezone()
+                        ).total_seconds(),
+                    )
+                in_delay = bool(delay_remaining and delay_remaining > 0)
+
             return {
                 "connected": self.connected,
                 "recording": self.recording,
                 "paused": self.paused,
                 "waiting_first_sample": self.waiting_first_sample,
+                "in_delay": in_delay,
+                "delay_remaining_seconds": delay_remaining,
+                "delay_seconds": self.delay_seconds,
                 "last_values": self.last_values,
                 "history": list(self.history),
                 "last_error": self.last_error,
@@ -538,7 +691,88 @@ class SerialCollector:
                 "duration_seconds": self.duration_seconds,
                 "interval_seconds": self.interval_seconds,
                 "sensors_selected": list(self.sensors_selected),
+                "reference_condition": self.reference_condition,
+                "finished_event": (
+                    dict(self.finished_event)
+                    if self.finished_event else None
+                ),
             }
+
+
+# ============================================================
+# ESTILO DOS GRAFICOS
+# ============================================================
+
+def style_chart(fig, x_title, title=None, show_legend=True):
+    """Aplica fontes maiores e layout padrão a todos os gráficos."""
+    fig.update_layout(
+        font=dict(size=CHART_FONT_BASE),
+        hoverlabel=dict(font=dict(size=CHART_FONT_BASE)),
+        showlegend=show_legend,
+        # Legenda horizontal acima do gráfico: nomes longos (sensor +
+        # condição de referência) não "espremem" a área do gráfico.
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            title=dict(text=""),
+            font=dict(size=CHART_FONT_LEGEND),
+        ),
+        uirevision="constante",
+        margin=dict(l=10, r=10, t=100 if show_legend else 70, b=10),
+    )
+    if title:
+        fig.update_layout(
+            title=dict(
+                text=title,
+                font=dict(size=CHART_FONT_TITLE),
+                x=0,
+                xanchor="left",
+            )
+        )
+    fig.update_xaxes(
+        title_text=x_title,
+        title_font=dict(size=CHART_FONT_AXIS_TITLE),
+        tickfont=dict(size=CHART_FONT_TICKS),
+        automargin=True,
+    )
+    fig.update_yaxes(
+        title_text="Valor Raw",
+        title_font=dict(size=CHART_FONT_AXIS_TITLE),
+        tickfont=dict(size=CHART_FONT_TICKS),
+        automargin=True,
+    )
+    return fig
+
+
+def _x_axis_label(x):
+    return {
+        "tempo_esp_ms": "Tempo no ESP32 (ms)",
+        "timestamp": "Data/hora",
+        "amostra": "Número da amostra",
+    }.get(x, x)
+
+
+def _plot_line(df, x, columns, title=None, condition=None, show_legend=True):
+    """Gráfico de linhas dos sensores.
+
+    A condição de referência vai no nome de cada linha (legenda), e, quando
+    `title` é informado, o título do gráfico também pode carregá-la.
+    """
+    if not columns:
+        return None
+    fig = px.line(df, x=x, y=columns)
+    fig.for_each_trace(
+        lambda t: t.update(name=sensor_display_name(t.name, condition))
+    )
+    return style_chart(
+        fig,
+        x_title=_x_axis_label(x),
+        title=title,
+        show_legend=show_legend,
+    )
 
 
 # ============================================================
@@ -583,7 +817,19 @@ def sidebar_countdown_fragment():
     saved = state.get("total_saved", 0)
     estimated = state.get("time_remaining_seconds")
 
-    if state.get("waiting_first_sample"):
+    if state.get("in_delay"):
+        if state["paused"]:
+            label = "⏸️ Tempo de pausa restante (pausado)"
+        else:
+            label = "⏳ Tempo de pausa restante"
+        st.metric(label, format_duration(state.get("delay_remaining_seconds")))
+        st.caption(
+            "A gravação começa quando o tempo de pausa terminar."
+        )
+        if target:
+            st.caption(f"Amostras alvo: **{target}**")
+
+    elif state.get("waiting_first_sample"):
         st.metric(
             "⏳ Aguardando 1ª leitura...",
             format_duration(state.get("duration_seconds")),
@@ -660,6 +906,40 @@ with st.sidebar:
         placeholder="Descreva as condições do experimento...",
     )
 
+    exp_condition = st.text_input(
+        "Condição de referência",
+        placeholder="Ex.: compactação x",
+        help=(
+            "Aparece nos gráficos ao lado do nome de cada sensor, "
+            "ex.: Capacitivo 1 (compactação x)."
+        ),
+    )
+
+    st.markdown(
+        "**Tempo de pausa (antes de gravar)**",
+        help=(
+            "Tempo de espera após iniciar o experimento. Durante ele os "
+            "dados aparecem nos gráficos, mas ainda não são gravados."
+        ),
+    )
+
+    delay_cols = st.columns(3)
+
+    delay_h = delay_cols[0].number_input(
+        "Horas", min_value=0, max_value=99,
+        value=0, step=1, key="exp_delay_h",
+    )
+    delay_m = delay_cols[1].number_input(
+        "Minutos", min_value=0, max_value=59,
+        value=0, step=1, key="exp_delay_m",
+    )
+    delay_s = delay_cols[2].number_input(
+        "Segundos", min_value=0, max_value=59,
+        value=0, step=1, key="exp_delay_s",
+    )
+
+    delay_seconds = delay_h * 3600 + delay_m * 60 + delay_s
+
     st.markdown("**Duração de referência**")
 
     dur_cols = st.columns(3)
@@ -730,6 +1010,8 @@ with st.sidebar:
                         duration_seconds,
                         sensors_selected,
                         interval,
+                        delay_seconds=delay_seconds,
+                        reference_condition=exp_condition,
                     )
                     st.success(f"Gravando em: {folder}")
                     st.rerun()
@@ -832,6 +1114,130 @@ with st.sidebar:
 
 
 # ============================================================
+# AVISO DE FIM DE TESTE (pop-up + faixa persistente)
+# ============================================================
+
+def _finish_summary(ev):
+    lines = []
+    if ev.get("nome"):
+        lines.append(f"**Experimento:** {ev['nome']}")
+
+    gravadas = ev.get("amostras_gravadas", 0)
+    alvo = ev.get("amostras_alvo")
+    lines.append(
+        f"**Amostras gravadas:** {gravadas}"
+        + (f" de {alvo}" if alvo else "")
+    )
+
+    if ev.get("duracao_real_segundos") is not None:
+        lines.append(
+            f"**Duração real:** "
+            f"{format_duration(ev['duracao_real_segundos'])}"
+        )
+    if ev.get("pasta"):
+        lines.append(f"**Pasta:** `{ev['pasta']}`")
+
+    return "\n\n".join(lines)
+
+
+def _show_notice(level, text):
+    {
+        "success": st.success,
+        "warning": st.warning,
+        "error": st.error,
+    }.get(level, st.info)(text)
+
+
+def _dismiss_finish_notice(event_id):
+    st.session_state["finish_notice_dismissed_id"] = event_id
+
+
+@st.dialog("🔔 Teste encerrado")
+def finish_dialog(ev):
+    level, text = FINISH_MESSAGES.get(
+        ev["status"], ("info", f"Status final: {ev['status']}")
+    )
+    _show_notice(level, text)
+    st.markdown(_finish_summary(ev))
+    st.caption(
+        "Fechar este pop-up não apaga o aviso fixo no topo da página; "
+        "use \"Entendi\" para dispensar os dois."
+    )
+    if st.button("Entendi", type="primary", width="stretch"):
+        _dismiss_finish_notice(ev["id"])
+        st.rerun()
+
+
+def render_finish_notice():
+    """Mostra o fim de um teste: pop-up uma vez + faixa fixa até ser fechada.
+
+    O pop-up abre uma única vez por teste (nesta aba do navegador). A faixa
+    no topo continua visível até o usuário clicar em "Fechar aviso" (ou
+    até iniciar um novo experimento).
+    """
+    ev = collector.snapshot().get("finished_event")
+    if not ev:
+        return
+    if st.session_state.get("finish_notice_dismissed_id") == ev["id"]:
+        return
+
+    level, text = FINISH_MESSAGES.get(
+        ev["status"], ("info", f"Status final: {ev['status']}")
+    )
+
+    with st.container(border=True):
+        _show_notice(level, f"🔔 {text}")
+        st.markdown(_finish_summary(ev))
+        st.button(
+            "✖ Fechar aviso",
+            key=f"close_finish_notice_{ev['id']}",
+            on_click=_dismiss_finish_notice,
+            args=(ev["id"],),
+        )
+
+    if st.session_state.get("finish_dialog_opened_id") != ev["id"]:
+        st.session_state["finish_dialog_opened_id"] = ev["id"]
+        finish_dialog(ev)
+
+
+# ============================================================
+# CONFIRMACAO AO FECHAR O NAVEGADOR / ABA
+# ============================================================
+
+_CONFIRM_CLOSE_JS = """
+<script>
+(function () {
+    const w = window.parent;
+    if (w.__confirmarFechamentoAtivo) return;
+    w.__confirmarFechamentoAtivo = true;
+    w.addEventListener("beforeunload", function (e) {
+        e.preventDefault();
+        e.returnValue = "";
+        return "";
+    });
+})();
+</script>
+"""
+
+
+def enable_close_confirmation():
+    """Pede confirmação do navegador antes de fechar/recarregar a página.
+
+    Observação: navegadores modernos mostram uma mensagem padrão (o texto
+    não pode ser personalizado) e só exibem o aviso depois que o usuário
+    interagiu com a página pelo menos uma vez.
+    """
+    script = _CONFIRM_CLOSE_JS.strip()
+    if hasattr(st, "iframe"):
+        # Streamlit recente: components.v1.html foi descontinuado.
+        st.iframe(script, height=1)
+    else:
+        import streamlit.components.v1 as components
+
+        components.html(script, height=0)
+
+
+# ============================================================
 # DASHBOARD EM TEMPO REAL
 # ============================================================
 
@@ -848,7 +1254,20 @@ def live_dashboard():
     if not data["connected"]:
         st.warning("ESP32 desconectado")
 
-    if data["recording"] and data.get("waiting_first_sample"):
+    if data["recording"] and data.get("in_delay"):
+        if data["paused"]:
+            st.info(
+                "Experimento pausado durante o tempo de pausa. A contagem "
+                "está congelada e nada está sendo gravado."
+            )
+        else:
+            st.info(
+                "⏳ Tempo de pausa em andamento: a gravação começa em "
+                f"{format_duration(data['delay_remaining_seconds'])}. "
+                "Os dados já aparecem nos gráficos, mas ainda não são "
+                "gravados."
+            )
+    elif data["recording"] and data.get("waiting_first_sample"):
         if data["paused"]:
             st.info(
                 "Experimento pausado durante a espera pela primeira "
@@ -919,6 +1338,9 @@ def live_dashboard():
         df = pd.DataFrame(history)
         df["amostra"] = range(1, len(df) + 1)
 
+        # Condição do experimento atual (ou do último, até ser descartado)
+        condition = data.get("reference_condition", "")
+
         capacitive_columns = [
             "capacitativo1_raw",
             "capacitativo2_raw",
@@ -931,50 +1353,16 @@ def live_dashboard():
         ]
 
         st.markdown("**Sensores capacitivos**")
-
-        fig_cap = px.line(
-            df,
-            x="amostra",
-            y=capacitive_columns,
-            labels={
-                "amostra": "Número da amostra",
-                "value": "Valor Raw",
-                "variable": "Sensor",
-            },
+        st.plotly_chart(
+            _plot_line(df, "amostra", capacitive_columns, condition=condition),
+            width="stretch",
         )
-        fig_cap.for_each_trace(
-            lambda trace: trace.update(
-                name=SENSOR_LABELS.get(trace.name, trace.name)
-            )
-        )
-        fig_cap.update_layout(
-            yaxis_title="Valor Raw",
-            legend_title="Sensor",
-        )
-        st.plotly_chart(fig_cap, width="stretch")
 
         st.markdown("**Sensores resistivos**")
-
-        fig_res = px.line(
-            df,
-            x="amostra",
-            y=resistive_columns,
-            labels={
-                "amostra": "Número da amostra",
-                "value": "Valor Raw",
-                "variable": "Sensor",
-            },
+        st.plotly_chart(
+            _plot_line(df, "amostra", resistive_columns, condition=condition),
+            width="stretch",
         )
-        fig_res.for_each_trace(
-            lambda trace: trace.update(
-                name=SENSOR_LABELS.get(trace.name, trace.name)
-            )
-        )
-        fig_res.update_layout(
-            yaxis_title="Valor Raw",
-            legend_title="Sensor",
-        )
-        st.plotly_chart(fig_res, width="stretch")
     else:
         st.info(
             "Os gráficos aparecerão assim que chegarem leituras válidas."
@@ -1060,32 +1448,6 @@ def _sensors_in_df(df):
     return [c for c in SENSOR_COLUMNS if c in df.columns]
 
 
-def _x_axis_label(x):
-    return {
-        "tempo_esp_ms": "Tempo no ESP32 (ms)",
-        "timestamp": "Data/hora",
-        "amostra": "Número da amostra",
-    }.get(x, x)
-
-
-def _plot_line(df, x, columns, title=None):
-    if not columns:
-        return None
-    fig = px.line(df, x=x, y=columns)
-    fig.for_each_trace(
-        lambda t: t.update(name=SENSOR_LABELS.get(t.name, t.name))
-    )
-    fig.update_layout(
-        title=title,
-        yaxis_title="Valor Raw",
-        legend_title="Sensor",
-        xaxis_title=_x_axis_label(x),
-        uirevision="constante",
-        margin=dict(l=10, r=10, t=40 if title else 10, b=10),
-    )
-    return fig
-
-
 def render_analysis_tab():
     st.header("Análise de experimentos salvos")
 
@@ -1132,12 +1494,17 @@ def render_analysis_tab():
 
     st.code(str(folder), language=None)
 
+    # Condição de referência gravada nos metadados (vazia em experimentos
+    # antigos, que não tinham esse campo).
+    condition = ((meta or {}).get("condicao_referencia") or "").strip()
+
     # ---- Metadados ----
     if meta:
         with st.expander("📋 Metadados do experimento", expanded=False):
             mcol1, mcol2 = st.columns(2)
             mcol1.markdown(
                 f"**Nome:** {meta.get('nome', '—')}\n\n"
+                f"**Condição de referência:** {condition or '—'}\n\n"
                 f"**Início:** {meta.get('inicio', '—')}\n\n"
                 f"**Fim:** {meta.get('fim', '—')}\n\n"
                 f"**Status:** {meta.get('status', '—')}\n\n"
@@ -1147,6 +1514,8 @@ def render_analysis_tab():
                 f"{meta.get('tN_ultima_amostra', '—')}"
             )
             mcol2.markdown(
+                f"**Tempo de pausa:** "
+                f"{format_duration(meta.get('tempo_pausa_configurado_segundos', 0))}\n\n"
                 f"**Duração configurada:** "
                 f"{format_duration(meta.get('duracao_configurada_segundos'))}\n\n"
                 f"**Duração real:** "
@@ -1193,6 +1562,8 @@ def render_analysis_tab():
         f"{len(df):,} amostras · "
         f"colunas: {', '.join(df.columns.tolist())}"
     )
+    if condition:
+        st.caption(f"Condição de referência: **{condition}**")
 
     df = df.copy()
     df["amostra"] = range(1, len(df) + 1)
@@ -1265,7 +1636,7 @@ def render_analysis_tab():
         for col in selected_sensors:
             s = df[col]
             stats_rows.append({
-                "Sensor": SENSOR_LABELS.get(col, col),
+                "Sensor": sensor_display_name(col, condition),
                 "Mínimo": float(s.min()),
                 "Máximo": float(s.max()),
                 "Média": float(s.mean()),
@@ -1280,7 +1651,10 @@ def render_analysis_tab():
     st.subheader("Gráficos")
 
     if mode == "Todos os sensores juntos":
-        fig = _plot_line(df_plot, x_axis, selected_sensors)
+        # Um único gráfico: a condição vai em cada item da legenda.
+        fig = _plot_line(
+            df_plot, x_axis, selected_sensors, condition=condition
+        )
         st.plotly_chart(fig, width="stretch")
 
     elif mode == "Por tipo (capacitivo/resistivo)":
@@ -1291,25 +1665,30 @@ def render_analysis_tab():
             c for c in selected_sensors if c.startswith("resistivo")
         ]
 
+        # Dois gráficos: a condição vai na legenda de cada um.
         if cap_cols:
             st.markdown("**Sensores capacitivos**")
             st.plotly_chart(
-                _plot_line(df_plot, x_axis, cap_cols),
+                _plot_line(df_plot, x_axis, cap_cols, condition=condition),
                 width="stretch",
             )
         if res_cols:
             st.markdown("**Sensores resistivos**")
             st.plotly_chart(
-                _plot_line(df_plot, x_axis, res_cols),
+                _plot_line(df_plot, x_axis, res_cols, condition=condition),
                 width="stretch",
             )
     else:
+        # Um gráfico por sensor: a condição vai no título (sem legenda,
+        # já que cada gráfico tem uma única linha).
         cols = st.columns(2)
         for i, sensor in enumerate(selected_sensors):
             with cols[i % 2]:
                 fig = _plot_line(
                     df_plot, x_axis, [sensor],
-                    title=SENSOR_LABELS.get(sensor, sensor),
+                    title=sensor_display_name(sensor, condition),
+                    condition=condition,
+                    show_legend=False,
                 )
                 st.plotly_chart(
                     fig,
@@ -1324,6 +1703,8 @@ def render_analysis_tab():
 # ABAS PRINCIPAIS
 # ============================================================
 
+render_finish_notice()
+
 tab_live, tab_analysis = st.tabs([
     "📈 Monitoramento ao vivo",
     "🗂️ Análise de experimentos",
@@ -1334,3 +1715,5 @@ with tab_live:
 
 with tab_analysis:
     render_analysis_tab()
+
+enable_close_confirmation()
