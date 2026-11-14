@@ -1,0 +1,43 @@
+{
+    "nome": "Monitoramento do solo teste1",
+    "descricao": "1231231",
+    "condicao_referencia_modo": "unica",
+    "condicao_referencia": "compactação 15%",
+    "condicoes_por_sensor": {
+        "capacitativo1_raw": "compactação 15%",
+        "capacitativo2_raw": "compactação 15%",
+        "capacitativo3_raw": "compactação 15%"
+    },
+    "inicio": "2026-11-14T14:35:40-03:00",
+    "fim": "2026-11-14T14:35:46-03:00",
+    "t0_primeira_amostra": null,
+    "tN_ultima_amostra": null,
+    "tempo_pausa_configurado_segundos": 5,
+    "duracao_configurada_segundos": 10,
+    "duracao_real_segundos": null,
+    "intervalo_configurado_segundos": 2.0,
+    "amostras_alvo": 5,
+    "amostras_gravadas": 0,
+    "intervalo_medido_ms_media": null,
+    "intervalo_medido_ms_dp": null,
+    "intervalo_medido_ms_min": null,
+    "intervalo_medido_ms_max": null,
+    "intervalo_medido_deltas_n": 0,
+    "status": "interrompido",
+    "porta_serial": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "sensores_selecionados": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw"
+    ],
+    "sensores_disponiveis": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw",
+        "resistivo1_raw",
+        "resistivo2_raw",
+        "resistivo3_raw"
+    ],
+    "observacao": "Valores Raw originais do ADS1115; calibracao ainda nao aplicada. Criterio de parada: contagem de amostras (duracao / intervalo)."
+}

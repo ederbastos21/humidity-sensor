@@ -140,7 +140,8 @@ class SerialCollector:
         self._delay_remaining = None  # congelado enquanto a gravacao esta pausada
 
         # Condicao de referencia (exibida nos graficos junto ao nome do sensor)
-        self.reference_condition = ""
+        self.reference_conditions = {}  # sensor -> condicao
+        self.reference_mode = "unica"   # "unica" ou "por_sensor"
 
         # Ultimo experimento encerrado (usado para avisar o usuario)
         self.finished_event = None
@@ -328,7 +329,8 @@ class SerialCollector:
 
     def start_experiment(self, name, description, duration_seconds,
                          sensors_selected, interval_seconds,
-                         delay_seconds=0, reference_condition=""):
+                         delay_seconds=0, reference_conditions=None,
+                         reference_mode="unica"):
         with self.lock:
             if not self.connected:
                 raise RuntimeError("Conecte o ESP32 antes de iniciar.")
@@ -349,8 +351,6 @@ class SerialCollector:
                     "O tempo de pausa não pode ser negativo."
                 )
 
-            reference_condition = (reference_condition or "").strip()
-
             selected = [
                 s for s in SENSOR_COLUMNS
                 if s in (sensors_selected or [])
@@ -358,6 +358,21 @@ class SerialCollector:
             if not selected:
                 raise RuntimeError(
                     "Selecione pelo menos um sensor para gravar."
+                )
+
+            # Condição de referência de cada sensor gravado. No modo "única"
+            # todos recebem o mesmo texto; em "por_sensor", cada um o seu.
+            reference_mode = (
+                "por_sensor" if reference_mode == "por_sensor" else "unica"
+            )
+            reference_conditions = {
+                s: str((reference_conditions or {}).get(s) or "").strip()
+                for s in selected
+            }
+            single_condition = ""
+            if reference_mode == "unica":
+                single_condition = next(
+                    iter(reference_conditions.values()), ""
                 )
 
             target_samples = max(
@@ -392,7 +407,9 @@ class SerialCollector:
             self.metadata = {
                 "nome": name.strip() or "Experimento",
                 "descricao": description.strip(),
-                "condicao_referencia": reference_condition,
+                "condicao_referencia_modo": reference_mode,
+                "condicao_referencia": single_condition,
+                "condicoes_por_sensor": dict(reference_conditions),
                 "inicio": now.isoformat(timespec="seconds"),
                 "fim": None,
                 "t0_primeira_amostra": None,
@@ -448,7 +465,8 @@ class SerialCollector:
                 if delay_seconds > 0
                 else None
             )
-            self.reference_condition = reference_condition
+            self.reference_conditions = dict(reference_conditions)
+            self.reference_mode = reference_mode
             self.finished_event = None
 
             return folder
@@ -691,7 +709,8 @@ class SerialCollector:
                 "duration_seconds": self.duration_seconds,
                 "interval_seconds": self.interval_seconds,
                 "sensors_selected": list(self.sensors_selected),
-                "reference_condition": self.reference_condition,
+                "reference_conditions": dict(self.reference_conditions),
+                "reference_mode": self.reference_mode,
                 "finished_event": (
                     dict(self.finished_event)
                     if self.finished_event else None
@@ -755,17 +774,20 @@ def _x_axis_label(x):
     }.get(x, x)
 
 
-def _plot_line(df, x, columns, title=None, condition=None, show_legend=True):
+def _plot_line(df, x, columns, title=None, conditions=None, show_legend=True):
     """Gráfico de linhas dos sensores.
 
-    A condição de referência vai no nome de cada linha (legenda), e, quando
-    `title` é informado, o título do gráfico também pode carregá-la.
+    `conditions` é um dict {coluna_do_sensor: condição}. A condição de cada
+    sensor vai no nome da sua linha (legenda).
     """
     if not columns:
         return None
+    conditions = conditions or {}
     fig = px.line(df, x=x, y=columns)
     fig.for_each_trace(
-        lambda t: t.update(name=sensor_display_name(t.name, condition))
+        lambda t: t.update(
+            name=sensor_display_name(t.name, conditions.get(t.name))
+        )
     )
     return style_chart(
         fig,
@@ -906,14 +928,39 @@ with st.sidebar:
         placeholder="Descreva as condições do experimento...",
     )
 
-    exp_condition = st.text_input(
+    # O Streamlit descarta o estado de campos que deixam de ser exibidos
+    # (troca de modo, sensor desmarcado). Reatribuir mantém o texto digitado.
+    for _k in ["exp_cond_single"] + [f"exp_cond_{s}" for s in SENSOR_COLUMNS]:
+        if _k in st.session_state:
+            st.session_state[_k] = st.session_state[_k]
+
+    cond_mode = st.radio(
         "Condição de referência",
-        placeholder="Ex.: compactação x",
+        ["Única", "Por sensor"],
+        horizontal=True,
+        key="exp_cond_mode",
         help=(
-            "Aparece nos gráficos ao lado do nome de cada sensor, "
-            "ex.: Capacitivo 1 (compactação x)."
+            "Aparece nos gráficos ao lado do nome do sensor, "
+            "ex.: Capacitivo 1 (compactação x).\n\n"
+            "**Única:** a mesma condição para todos os sensores.\n\n"
+            "**Por sensor:** uma condição para cada sensor."
         ),
     )
+    per_sensor_cond = cond_mode == "Por sensor"
+
+    single_condition = ""
+    if per_sensor_cond:
+        st.caption(
+            "Preencha ao lado de cada sensor, em "
+            "\"Sensores a gravar no CSV\"."
+        )
+    else:
+        single_condition = st.text_input(
+            "Condição única",
+            placeholder="Ex.: compactação x",
+            key="exp_cond_single",
+            label_visibility="collapsed",
+        )
 
     st.markdown(
         "**Tempo de pausa (antes de gravar)**",
@@ -967,18 +1014,40 @@ with st.sidebar:
     st.markdown("**Sensores a gravar no CSV**")
 
     sensors_selected = []
+    sensor_conditions = {}
     for sensor_key in SENSOR_COLUMNS:
-        if st.checkbox(
+        # No modo "Por sensor", o campo da condição fica na mesma linha do
+        # checkbox (só aparece para sensores marcados), sem ocupar espaço extra.
+        if per_sensor_cond:
+            cb_col, txt_col = st.columns([5, 7], vertical_alignment="center")
+        else:
+            cb_col, txt_col = st.container(), None
+
+        if cb_col.checkbox(
             SENSOR_LABELS[sensor_key],
             value=True,
             key=f"sensor_cb_{sensor_key}",
         ):
             sensors_selected.append(sensor_key)
+            if txt_col is not None:
+                sensor_conditions[sensor_key] = txt_col.text_input(
+                    f"Condição de {SENSOR_LABELS[sensor_key]}",
+                    placeholder="condição",
+                    key=f"exp_cond_{sensor_key}",
+                    label_visibility="collapsed",
+                )
 
     if not sensors_selected:
         st.warning(
             "Marque pelo menos um sensor para poder iniciar o experimento."
         )
+
+    if per_sensor_cond:
+        reference_mode = "por_sensor"
+        reference_conditions = sensor_conditions
+    else:
+        reference_mode = "unica"
+        reference_conditions = {s: single_condition for s in sensors_selected}
 
     # --------------------------------------------------------
     # BOTAO DE INICIAR **OU** CONTAGEM REGRESSIVA
@@ -1011,7 +1080,8 @@ with st.sidebar:
                         sensors_selected,
                         interval,
                         delay_seconds=delay_seconds,
-                        reference_condition=exp_condition,
+                        reference_conditions=reference_conditions,
+                        reference_mode=reference_mode,
                     )
                     st.success(f"Gravando em: {folder}")
                     st.rerun()
@@ -1338,8 +1408,8 @@ def live_dashboard():
         df = pd.DataFrame(history)
         df["amostra"] = range(1, len(df) + 1)
 
-        # Condição do experimento atual (ou do último, até ser descartado)
-        condition = data.get("reference_condition", "")
+        # Condições do experimento atual (ou do último, até ser descartado)
+        conditions = data.get("reference_conditions", {})
 
         capacitive_columns = [
             "capacitativo1_raw",
@@ -1354,13 +1424,13 @@ def live_dashboard():
 
         st.markdown("**Sensores capacitivos**")
         st.plotly_chart(
-            _plot_line(df, "amostra", capacitive_columns, condition=condition),
+            _plot_line(df, "amostra", capacitive_columns, conditions=conditions),
             width="stretch",
         )
 
         st.markdown("**Sensores resistivos**")
         st.plotly_chart(
-            _plot_line(df, "amostra", resistive_columns, condition=condition),
+            _plot_line(df, "amostra", resistive_columns, conditions=conditions),
             width="stretch",
         )
     else:
@@ -1448,6 +1518,37 @@ def _sensors_in_df(df):
     return [c for c in SENSOR_COLUMNS if c in df.columns]
 
 
+def _conditions_from_meta(meta):
+    """Condição de cada sensor, lida dos metadados.
+
+    Experimentos novos trazem `condicoes_por_sensor`. Os anteriores só tinham
+    `condicao_referencia` (única), aplicada a todos os sensores; os mais
+    antigos não tinham nenhuma.
+    """
+    meta = meta or {}
+    per_sensor = meta.get("condicoes_por_sensor")
+    if isinstance(per_sensor, dict):
+        return {
+            s: str(per_sensor.get(s) or "").strip() for s in SENSOR_COLUMNS
+        }
+    single = str(meta.get("condicao_referencia") or "").strip()
+    return {s: single for s in SENSOR_COLUMNS}
+
+
+def _conditions_summary(conditions, sensors):
+    """Resumo em texto das condições. Retorna (texto, é_condição_única)."""
+    filled = [(s, conditions.get(s, "")) for s in sensors]
+    filled = [(s, c) for s, c in filled if c]
+    if not filled:
+        return "", True
+    if len(filled) == len(sensors) and len({c for _, c in filled}) == 1:
+        return filled[0][1], True
+    return (
+        "; ".join(f"{SENSOR_LABELS.get(s, s)}: {c}" for s, c in filled),
+        False,
+    )
+
+
 def render_analysis_tab():
     st.header("Análise de experimentos salvos")
 
@@ -1494,9 +1595,12 @@ def render_analysis_tab():
 
     st.code(str(folder), language=None)
 
-    # Condição de referência gravada nos metadados (vazia em experimentos
+    # Condições de referência gravadas nos metadados (vazias em experimentos
     # antigos, que não tinham esse campo).
-    condition = ((meta or {}).get("condicao_referencia") or "").strip()
+    conditions = _conditions_from_meta(meta)
+    condition_text, condition_is_single = _conditions_summary(
+        conditions, _sensors_in_df(df)
+    )
 
     # ---- Metadados ----
     if meta:
@@ -1504,7 +1608,7 @@ def render_analysis_tab():
             mcol1, mcol2 = st.columns(2)
             mcol1.markdown(
                 f"**Nome:** {meta.get('nome', '—')}\n\n"
-                f"**Condição de referência:** {condition or '—'}\n\n"
+                f"**Condição de referência:** {condition_text or '—'}\n\n"
                 f"**Início:** {meta.get('inicio', '—')}\n\n"
                 f"**Fim:** {meta.get('fim', '—')}\n\n"
                 f"**Status:** {meta.get('status', '—')}\n\n"
@@ -1562,8 +1666,8 @@ def render_analysis_tab():
         f"{len(df):,} amostras · "
         f"colunas: {', '.join(df.columns.tolist())}"
     )
-    if condition:
-        st.caption(f"Condição de referência: **{condition}**")
+    if condition_text and condition_is_single:
+        st.caption(f"Condição de referência: **{condition_text}**")
 
     df = df.copy()
     df["amostra"] = range(1, len(df) + 1)
@@ -1636,7 +1740,7 @@ def render_analysis_tab():
         for col in selected_sensors:
             s = df[col]
             stats_rows.append({
-                "Sensor": sensor_display_name(col, condition),
+                "Sensor": sensor_display_name(col, conditions.get(col)),
                 "Mínimo": float(s.min()),
                 "Máximo": float(s.max()),
                 "Média": float(s.mean()),
@@ -1653,7 +1757,7 @@ def render_analysis_tab():
     if mode == "Todos os sensores juntos":
         # Um único gráfico: a condição vai em cada item da legenda.
         fig = _plot_line(
-            df_plot, x_axis, selected_sensors, condition=condition
+            df_plot, x_axis, selected_sensors, conditions=conditions
         )
         st.plotly_chart(fig, width="stretch")
 
@@ -1669,13 +1773,13 @@ def render_analysis_tab():
         if cap_cols:
             st.markdown("**Sensores capacitivos**")
             st.plotly_chart(
-                _plot_line(df_plot, x_axis, cap_cols, condition=condition),
+                _plot_line(df_plot, x_axis, cap_cols, conditions=conditions),
                 width="stretch",
             )
         if res_cols:
             st.markdown("**Sensores resistivos**")
             st.plotly_chart(
-                _plot_line(df_plot, x_axis, res_cols, condition=condition),
+                _plot_line(df_plot, x_axis, res_cols, conditions=conditions),
                 width="stretch",
             )
     else:
@@ -1686,8 +1790,8 @@ def render_analysis_tab():
             with cols[i % 2]:
                 fig = _plot_line(
                     df_plot, x_axis, [sensor],
-                    title=sensor_display_name(sensor, condition),
-                    condition=condition,
+                    title=sensor_display_name(sensor, conditions.get(sensor)),
+                    conditions=conditions,
                     show_legend=False,
                 )
                 st.plotly_chart(
