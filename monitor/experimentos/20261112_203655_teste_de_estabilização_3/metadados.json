@@ -1,0 +1,35 @@
+{
+    "nome": "teste de estabilização 3",
+    "descricao": "amostras de cada sensor levemente irregulares, compactação forte.\ntestes iniciados imediatamente após inserção dos sensores na terra",
+    "inicio": "2026-11-12T20:36:55-03:00",
+    "fim": "2026-11-12T22:36:53-03:00",
+    "t0_primeira_amostra": "2026-11-12T20:36:55-03:00",
+    "tN_ultima_amostra": "2026-11-12T22:36:53-03:00",
+    "duracao_configurada_segundos": 7200,
+    "duracao_real_segundos": 7197.847,
+    "intervalo_configurado_segundos": 2.0,
+    "amostras_alvo": 3600,
+    "amostras_gravadas": 3600,
+    "intervalo_medido_ms_media": 2000.0,
+    "intervalo_medido_ms_dp": 0.0,
+    "intervalo_medido_ms_min": 2000,
+    "intervalo_medido_ms_max": 2000,
+    "intervalo_medido_deltas_n": 3599,
+    "status": "finalizado_por_amostras",
+    "porta_serial": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "sensores_selecionados": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw"
+    ],
+    "sensores_disponiveis": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw",
+        "resistivo1_raw",
+        "resistivo2_raw",
+        "resistivo3_raw"
+    ],
+    "observacao": "Valores Raw originais do ADS1115; calibracao ainda nao aplicada. Criterio de parada: contagem de amostras (duracao / intervalo)."
+}
