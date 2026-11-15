@@ -1270,41 +1270,32 @@ def render_finish_notice():
         finish_dialog(ev)
 
 
+
 # ============================================================
 # CONFIRMACAO AO FECHAR O NAVEGADOR / ABA
 # ============================================================
 
-_CONFIRM_CLOSE_JS = """
-<script>
-(function () {
-    const w = window.parent;
-    if (w.__confirmarFechamentoAtivo) return;
-    w.__confirmarFechamentoAtivo = true;
-    w.addEventListener("beforeunload", function (e) {
-        e.preventDefault();
-        e.returnValue = "";
-        return "";
-    });
-})();
-</script>
-"""
-
-
 def enable_close_confirmation():
-    """Pede confirmação do navegador antes de fechar/recarregar a página.
+    """Instala confirmação nativa ao fechar ou recarregar a página."""
 
-    Observação: navegadores modernos mostram uma mensagem padrão (o texto
-    não pode ser personalizado) e só exibem o aviso depois que o usuário
-    interagiu com a página pelo menos uma vez.
-    """
-    script = _CONFIRM_CLOSE_JS.strip()
-    if hasattr(st, "iframe"):
-        # Streamlit recente: components.v1.html foi descontinuado.
-        st.iframe(script, height=1)
-    else:
-        import streamlit.components.v1 as components
+    st.html(
+        """
+        <script>
+        (() => {
+            const w = window;
 
-        components.html(script, height=0)
+            if (w.__confirmarFechamentoAtivo) return;
+            w.__confirmarFechamentoAtivo = true;
+
+            w.addEventListener("beforeunload", (event) => {
+                event.preventDefault();
+                event.returnValue = "";
+            });
+        })();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
 
 
 # ============================================================
