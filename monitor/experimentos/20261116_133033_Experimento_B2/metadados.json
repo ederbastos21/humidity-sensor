@@ -1,0 +1,43 @@
+{
+    "nome": "Experimento B2",
+    "descricao": "",
+    "condicao_referencia_modo": "unica",
+    "condicao_referencia": "10% redução volumetrica",
+    "condicoes_por_sensor": {
+        "capacitativo1_raw": "10% redução volumetrica",
+        "capacitativo2_raw": "10% redução volumetrica",
+        "capacitativo3_raw": "10% redução volumetrica"
+    },
+    "inicio": "2026-11-16T13:30:33-03:00",
+    "fim": "2026-11-16T14:10:32-03:00",
+    "t0_primeira_amostra": "2026-11-16T13:40:34-03:00",
+    "tN_ultima_amostra": "2026-11-16T14:10:32-03:00",
+    "tempo_pausa_configurado_segundos": 600,
+    "duracao_configurada_segundos": 1800,
+    "duracao_real_segundos": 1797.965,
+    "intervalo_configurado_segundos": 2.0,
+    "amostras_alvo": 900,
+    "amostras_gravadas": 900,
+    "intervalo_medido_ms_media": 2000.0,
+    "intervalo_medido_ms_dp": 0.0,
+    "intervalo_medido_ms_min": 2000,
+    "intervalo_medido_ms_max": 2000,
+    "intervalo_medido_deltas_n": 899,
+    "status": "finalizado_por_amostras",
+    "porta_serial": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "sensores_selecionados": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw"
+    ],
+    "sensores_disponiveis": [
+        "capacitativo1_raw",
+        "capacitativo2_raw",
+        "capacitativo3_raw",
+        "resistivo1_raw",
+        "resistivo2_raw",
+        "resistivo3_raw"
+    ],
+    "observacao": "Valores Raw originais do ADS1115; calibracao ainda nao aplicada. Criterio de parada: contagem de amostras (duracao / intervalo)."
+}
